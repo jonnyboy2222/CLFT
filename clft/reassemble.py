@@ -112,8 +112,23 @@ class Reassemble(nn.Module):
         #Projection + Resample
         self.resample = Resample(p, s, image_height, emb_dim, resample_dim)
 
+    # def forward(self, x):
+    #     x = self.read(x)
+    #     x = self.concat(x)
+    #     x = self.resample(x)
+    #     return x
+
     def forward(self, x):
-        x = self.read(x)
-        x = self.concat(x)
+        # x: [B, N, C] (ViT/Swin 공통 형태)
+        x = self.read(x)  # cls token 제거 / projection 등
+
+        b, n, c = x.shape
+        h = int((n) ** 0.5)
+        w = n // h
+        assert h * w == n, f"Reassemble: token length {n} is not a perfect square"
+
+        # [B, N, C] -> [B, C, H, W]
+        x = x.transpose(1, 2).contiguous().view(b, c, h, w)
+
         x = self.resample(x)
         return x
