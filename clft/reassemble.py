@@ -5,13 +5,26 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
 
+# class Read_ignore(nn.Module):
+#     def __init__(self, start_index=1):
+#         super(Read_ignore, self).__init__()
+#         self.start_index = start_index
+
+#     def forward(self, x):
+#         return x[:, self.start_index:]
+
+
+# ======READ MODULE들은 CLS TOKEN 처리용 모듈======
+# swin용
 class Read_ignore(nn.Module):
-    def __init__(self, start_index=1):
+    def __init__(self, start_index=0):
         super(Read_ignore, self).__init__()
         self.start_index = start_index
 
     def forward(self, x):
-        return x[:, self.start_index:]
+        # Swin 같이 CLS 토큰이 없는 백본에서도 안전하게 쓰기 위해
+        # 아무 토큰도 버리지 않고 그대로 반환
+        return x
 
 
 class Read_add(nn.Module):
@@ -50,37 +63,91 @@ class MyConvTranspose2d(nn.Module):
         return x
 
 
+# class Resample(nn.Module):
+#     def __init__(self, p, s, h, emb_dim, resample_dim):
+#         super(Resample, self).__init__()
+#         assert (s in [4, 8, 16, 32]), "s must be in [0.5, 4, 8, 16, 32]"
+#         self.conv1 = nn.Conv2d(emb_dim, resample_dim, kernel_size=1, stride=1, padding=0)
+#         if s == 4:
+#             self.conv2 = nn.ConvTranspose2d(resample_dim,
+#                                 resample_dim,
+#                                 kernel_size=4,
+#                                 stride=4,
+#                                 padding=0,
+#                                 bias=True,
+#                                 dilation=1,
+#                                 groups=1)
+#         elif s == 8:
+#             self.conv2 = nn.ConvTranspose2d(resample_dim,
+#                                 resample_dim,
+#                                 kernel_size=2,
+#                                 stride=2,
+#                                 padding=0,
+#                                 bias=True,
+#                                 dilation=1,
+#                                 groups=1)
+#         elif s == 16:
+#             self.conv2 = nn.Identity()
+#         else:
+#             self.conv2 = nn.Conv2d(resample_dim, resample_dim, kernel_size=2,stride=2, padding=0, bias=True)
+
+#     def forward(self, x):
+#         x = self.conv1(x)
+#         x = self.conv2(x)
+#         return x
+
+
+
 class Resample(nn.Module):
-    def __init__(self, p, s, h, emb_dim, resample_dim):
+    def __init__(self, p, s, image_height, emb_dim, resample_dim):
         super(Resample, self).__init__()
-        assert (s in [4, 8, 16, 32]), "s must be in [0.5, 4, 8, 16, 32]"
-        self.conv1 = nn.Conv2d(emb_dim, resample_dim, kernel_size=1, stride=1, padding=0)
+        '''
+        1. 크기와 채널을 stage별로 통일 
+        2. conv1x1로 채널 통일 후 해상도 up/down sampling
+        3. stage별 s(배수)값에 맞춤
+        '''
+        # conv1은 첫 입력의 채널 수를 보고 나중에 만들기 위해 None으로 시작
+        self.conv1 = None
+        self.resample_dim = resample_dim
+        self.s = s
+
+        # s 값에 따라 해상도 조정용 conv2 설정
         if s == 4:
-            self.conv2 = nn.ConvTranspose2d(resample_dim,
-                                resample_dim,
-                                kernel_size=4,
-                                stride=4,
-                                padding=0,
-                                bias=True,
-                                dilation=1,
-                                groups=1)
+            # 1/4 해상도 -> x4 업샘플
+            self.conv2 = nn.ConvTranspose2d(
+                resample_dim, resample_dim,
+                kernel_size=4, stride=4, padding=0, bias=True
+            )
         elif s == 8:
-            self.conv2 = nn.ConvTranspose2d(resample_dim,
-                                resample_dim,
-                                kernel_size=2,
-                                stride=2,
-                                padding=0,
-                                bias=True,
-                                dilation=1,
-                                groups=1)
+            # 1/8 해상도 -> x2 업샘플
+            self.conv2 = nn.ConvTranspose2d(
+                resample_dim, resample_dim,
+                kernel_size=2, stride=2, padding=0, bias=True
+            )
         elif s == 16:
+            # 1/16 해상도 그대로 사용
             self.conv2 = nn.Identity()
         else:
-            self.conv2 = nn.Conv2d(resample_dim, resample_dim, kernel_size=2,stride=2, padding=0, bias=True)
+            # 1/32 해상도 -> x0.5 (다운샘플)
+            self.conv2 = nn.Conv2d(
+                resample_dim, resample_dim,
+                kernel_size=2, stride=2, padding=0, bias=True
+            )
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
+        # x: [B, C_in, H, W]
+
+        # 첫 forward에 들어온 채널 수를 보고 conv1 생성
+        if self.conv1 is None:
+            in_channels = x.shape[1]
+            self.conv1 = nn.Conv2d(
+                in_channels,
+                self.resample_dim,
+                kernel_size=1, stride=1, padding=0, bias=True
+            ).to(x.device)
+
+        x = self.conv1(x)  # [B, resample_dim, H, W]
+        x = self.conv2(x)  # 업/다운샘플
         return x
 
 
@@ -92,6 +159,14 @@ class Reassemble(nn.Module):
         emb_dim <=> D (in the paper)
         resample_dim <=> ^D (in the paper)
         read : {"ignore", "add", "projection"}
+
+        - 두 모달리티의 (CAM LIDAR) FEATURE MAP을 항상 [B, C, H, W]로 재구성 목적
+        ViT   : [B, N ,C]      ->      [B, C, H, W]
+        Swin  : [B, H, W, C]   ->      [B, C, H, W]
+
+        - 또한 Cam과 lidar간 feature 정규화를 한다
+        Cam   : 96x96
+        Lidar : 64x256
         """
         super(Reassemble, self).__init__()
         channels, image_height, image_width = image_size
@@ -120,35 +195,26 @@ class Reassemble(nn.Module):
 
     def forward(self, x):
         """
-        x: 
-        - 일부 백본(ViT 등)은 [B, N, C] 토큰 시퀀스를 직접 내보내고,
-        - Swin처럼 conv-ish 구조인 경우 [B, C, H, W] feature map을 내보내기도 한다.
-        여기서는 두 경우를 모두 지원하기 위해:
-        1) 4D면 먼저 [B, C, H, W] -> [B, N, C] 로 평탄화
-        2) 그 다음 read(CLS 처리 등)를 적용
-        3) 다시 2D grid로 reshape 후 Resample
+        x:
+          - Swin 계열: [B, H, W, C]  (hook에서 그대로 들어옴)
+          - ViT 계열: [B, N, C]     (토큰 시퀀스)
         """
 
-        # 1) 만약 hook에서 4D feature map이 들어왔다면, 토큰 시퀀스로 변환
         if x.dim() == 4:
-            # x: [B, C, H, W]
-            b, c, h, w = x.shape
-            # [B, C, H, W] -> [B, C, H*W] -> [B, H*W, C]
-            x = x.view(b, c, h * w).transpose(1, 2).contiguous()
+            # Swin: [B, H, W, C] -> [B, C, H, W]
+            b, h, w, c = x.shape
+            x = x.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
 
-        # 여기까지 오면 x는 항상 [B, N, C] 형태
-        x = self.read(x)  # Read_ignore / Read_add / Read_projection
+            # Swin에는 CLS 토큰이 없고, 이미 2D map이므로 read/concat 생략
+            # 바로 Resample로 보냄
 
-        b, n, c = x.shape
-        # N = H' * W' 인 완전 제곱수라고 가정 (토큰이 2D grid에서 flatten된 것)
-        h = int(n ** 0.5)
-        w = n // h
-        assert h * w == n, f"Reassemble: token length {n} is not a perfect square"
+        else:
+            # ViT: [B, N, C]
+            x = self.read(x)   # Read_ignore / Read_add / Read_projection
+            x = self.concat(x) # [B, C, H, W]
 
-        # [B, N, C] -> [B, C, H', W']
-        x = x.transpose(1, 2).contiguous().view(b, c, h, w)
-
-        # Projection + up/down-sampling
-        x = self.resample(x)
+        # 공통: NCHW 상태에서 Resample
+        x = self.resample(x)   # [B, resample_dim, H_out, W_out]
         return x
+
 
