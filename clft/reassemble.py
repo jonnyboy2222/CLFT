@@ -119,16 +119,36 @@ class Reassemble(nn.Module):
     #     return x
 
     def forward(self, x):
-        # x: [B, N, C] (ViT/Swin 공통 형태)
-        x = self.read(x)  # cls token 제거 / projection 등
+        """
+        x: 
+        - 일부 백본(ViT 등)은 [B, N, C] 토큰 시퀀스를 직접 내보내고,
+        - Swin처럼 conv-ish 구조인 경우 [B, C, H, W] feature map을 내보내기도 한다.
+        여기서는 두 경우를 모두 지원하기 위해:
+        1) 4D면 먼저 [B, C, H, W] -> [B, N, C] 로 평탄화
+        2) 그 다음 read(CLS 처리 등)를 적용
+        3) 다시 2D grid로 reshape 후 Resample
+        """
+
+        # 1) 만약 hook에서 4D feature map이 들어왔다면, 토큰 시퀀스로 변환
+        if x.dim() == 4:
+            # x: [B, C, H, W]
+            b, c, h, w = x.shape
+            # [B, C, H, W] -> [B, C, H*W] -> [B, H*W, C]
+            x = x.view(b, c, h * w).transpose(1, 2).contiguous()
+
+        # 여기까지 오면 x는 항상 [B, N, C] 형태
+        x = self.read(x)  # Read_ignore / Read_add / Read_projection
 
         b, n, c = x.shape
-        h = int((n) ** 0.5)
+        # N = H' * W' 인 완전 제곱수라고 가정 (토큰이 2D grid에서 flatten된 것)
+        h = int(n ** 0.5)
         w = n // h
         assert h * w == n, f"Reassemble: token length {n} is not a perfect square"
 
-        # [B, N, C] -> [B, C, H, W]
+        # [B, N, C] -> [B, C, H', W']
         x = x.transpose(1, 2).contiguous().view(b, c, h, w)
 
+        # Projection + up/down-sampling
         x = self.resample(x)
         return x
+
