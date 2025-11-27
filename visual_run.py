@@ -146,6 +146,14 @@ def run(modality, backbone, config):
             )
         print(f'Using backbone {args.backbone}')
 
+        # dummy forward로 conv1 실제 생성
+        model.to(device)
+        model.eval()
+        with torch.no_grad():
+            dummy_rgb = torch.zeros(1, 3, resize, resize, device=device)
+            dummy_lidar = torch.zeros(1, 3, resize, resize, device=device)
+            _ = model(dummy_rgb, dummy_lidar, modality)  # 여기서 reassemble.resample.conv1들이 다 만들어짐
+
         model_path = config['General']['model_path']
         model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
         model.to(device)
