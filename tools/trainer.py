@@ -8,6 +8,7 @@ from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 
+
 from clfcn.fusion_net import FusionNet
 from utils.metrics import find_overlap
 from utils.metrics import find_overlap_1
@@ -16,6 +17,32 @@ from utils.helpers import EarlyStopping
 from utils.helpers import save_model_dict
 from utils.helpers import adjust_learning_rate_clft
 from utils.helpers import adjust_learning_rate_clfcn
+
+# focal loss
+import torch.nn.functional as F
+class FocalLoss(nn.Module):
+    # increasing gamma reduces more contribution of good ones
+    # alpha balances the importance of different classes
+    # reduction specifies how to aggregate the loss
+    def __init__(self, gamma=2.0, alpha=None, reduction="mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # inputs: BCHW
+        # targets: BHW
+        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
+        pt = torch.exp(-ce_loss)  # pt = softmax 결과의 정답 클래스 확률
+
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+
+        if self.alpha is not None:
+            at = self.alpha[targets]
+            focal_loss = focal_loss * at
+
+        return focal_loss.mean() if self.reduction == "mean" else focal_loss
 
 
 writer = SummaryWriter()
@@ -65,6 +92,16 @@ class Trainer(object):
         weight_loss[1] = 4
         weight_loss[2] = 10
         self.criterion = nn.CrossEntropyLoss(weight=weight_loss).to(self.device)
+
+        # focal loss
+        alpha_vec = torch.ones(self.nclasses, device=self.device)
+        alpha_vec[2] = 2.0 # human class에 2배 가중치
+        self.focal_loss = FocalLoss(
+            gamma=2.0,
+            alpha=alpha_vec,
+            reduction="none" # per pixel로 받은 후 human만 골라서 평균낼 예정
+        )
+        self.lambda_focal = 0.5 # L = CE + 0.5 * focal
 
         if self.config['General']['resume_training'] is True:
             print('Resume training...')
@@ -126,10 +163,33 @@ class Trainer(object):
                 label_cum += batch_label
                 union_cum += batch_union
 
-                loss = self.criterion(output_seg, batch['anno'])
+                # loss = self.criterion(output_seg, batch['anno'])
+                
+                # 원래 주석
                 # w_rgb = 1.1
                 # w_lid = 0.9
                 # loss = w_rgb*loss_rgb + w_lid*loss_lidar + loss_fusion
+
+                # focal loss
+                # 1) 기본 ce loss
+                ce = self.criterion(output_seg, anno)
+                
+                # 2) focal loss 전체 픽셀에 대해 계산
+                focal_map = self.focal_loss(output_seg, anno)
+
+                # 3) human class만 골라내기
+                human_idx = 2
+                human_mask = (anno == human_idx) # [B, H, W] bool
+
+                if human_mask.any():
+                    focal_human = focal_map[human_mask].mean()
+                else:
+                    # human 픽셀이 없는 batch에서는 focal을 0으로
+                    focal_human = 0.0 * ce
+
+                # 4) 최종 loss: CE + lambda * Focal(human 전용)
+                loss = ce + self.lambda_focal * focal_human
+                
 
                 train_loss += loss.item()
                 loss.backward()
@@ -194,7 +254,28 @@ class Trainer(object):
                 label_cum += batch_label
                 union_cum += batch_union
 
-                loss = self.criterion(output_seg, batch['anno'])
+                # loss = self.criterion(output_seg, batch['anno'])
+
+                # focal loss
+                # 1) 기본 ce loss
+                ce = self.criterion(output_seg, anno)
+                
+                # 2) focal loss 전체 픽셀에 대해 계산
+                focal_map = self.focal_loss(output_seg, anno)
+
+                # 3) human class만 골라내기
+                human_idx = 2
+                human_mask = (anno == human_idx) # [B, H, W] bool
+
+                if human_mask.any():
+                    focal_human = focal_map[human_mask].mean()
+                else:
+                    # human 픽셀이 없는 batch에서는 focal을 0으로
+                    focal_human = 0.0 * ce
+
+                # 4) 최종 loss: CE + lambda * Focal(human 전용)
+                loss = ce + self.lambda_focal * focal_human
+
                 valid_loss += loss.item()
                 progress_bar.set_description(f'valid fusion loss: {loss:.4f}')
         # The IoU of one epoch

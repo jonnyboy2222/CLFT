@@ -101,18 +101,19 @@ class CLFT(nn.Module):
             def hook(model, input, output):
                 self.activation[name] = output
             return hook
-        # for h in hooks:
-            #self.transformer_encoders.layers[h].register_forward_hook(get_activation('t'+str(h)))
-            # self.transformer_encoders.blocks[h].register_forward_hook(get_activation('t'+str(h)))
+        for h in hooks:
+            # self.transformer_encoders.layers[h].register_forward_hook(get_activation('t'+str(h)))
+            self.transformer_encoders.blocks[h].register_forward_hook(get_activation('t'+str(h)))
         
+        # swin용
         # Swin 계열(backbone.layers[*].blocks[*])인 경우
-        if hasattr(self.transformer_encoders, "layers") and hasattr(self.transformer_encoders.layers[0], "blocks"):
-            # config["CLFT"]["hooks"]를 stage index로 해석: 예) [0,1,2,3]
-            for h in hooks:
-                stage = self.transformer_encoders.layers[h]
-                block = stage.blocks[-1]  # 해당 stage의 마지막 block에서 feature 추출
-                block.register_forward_hook(get_activation('t' + str(h)))
-        else:
-            # ViT 계열: 기존 코드 (blocks[h]) 그대로 사용
-            for h in hooks:
-                self.transformer_encoders.blocks[h].register_forward_hook(get_activation('t' + str(h)))
+        # if hasattr(self.transformer_encoders, "layers") and hasattr(self.transformer_encoders.layers[0], "blocks"):
+        #     # config["CLFT"]["hooks"]를 stage index로 해석: 예) [0,1,2,3]
+        #     for h in hooks:
+        #         stage = self.transformer_encoders.layers[h]
+        #         block = stage.blocks[-1]  # 해당 stage의 마지막 block에서 feature 추출
+        #         block.register_forward_hook(get_activation('t' + str(h)))
+        # else:
+        #     # ViT 계열: 기존 코드 (blocks[h]) 그대로 사용
+        #     for h in hooks:
+        #         self.transformer_encoders.blocks[h].register_forward_hook(get_activation('t' + str(h)))
