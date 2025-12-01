@@ -7,7 +7,7 @@ from einops.layers.torch import Rearrange
 
 from clft.reassemble import Reassemble
 from clft.fusion import Fusion
-from clft.head import HeadDepth, HeadSeg
+from clft.head import HeadDepth, HeadSeg # , HeadAuxHuman
 
 torch.manual_seed(0)
 
@@ -69,6 +69,8 @@ class CLFT(nn.Module):
         else:
             self.head_depth = None
             self.head_segmentation = HeadSeg(resample_dim, nclasses=nclasses)
+            # 보조헤드
+            # self.head_aux_human = HeadAuxHuman(resample_dim)
 
     def forward(self, rgb, lidar, modal='rgb'):
         t = self.transformer_encoders(lidar)
@@ -90,11 +92,18 @@ class CLFT(nn.Module):
             previous_stage = fusion_result
         out_depth = None
         out_segmentation = None
+        # 보조헤드
+        # out_aux_human = None
+
         if self.head_depth != None:
             out_depth = self.head_depth(previous_stage)
         if self.head_segmentation != None:
             out_segmentation = self.head_segmentation(previous_stage)
-        return out_depth, out_segmentation
+        # 보조헤드
+        # if hasattr(self, "head_aux_human") and self.head_aux_human is not None:
+        #     out_aux_human = self.head_aux_human(previous_stage)
+
+        return out_depth, out_segmentation, # out_aux_human
 
     def _get_layers_from_hooks(self, hooks):
         def get_activation(name):
