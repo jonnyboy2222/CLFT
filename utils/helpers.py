@@ -198,29 +198,90 @@ def adjust_learning_rate_clfcn(config, optimizer, epoch):
 #     return lr
 
 
+# class EarlyStopping(object):
+#     def __init__(self, config):
+#         self.patience = config['General']['early_stop_patience']
+#         self.config = config
+#         self.min_param = None
+#         self.early_stop_trigger = False
+#         self.count = 0
+
+#     def __call__(self, valid_param, epoch, model, modality, optimizer):
+#         if self.min_param is None:
+#             self.min_param = valid_param
+#         elif valid_param <= self.min_param:
+#             self.count += 1
+#             print(f'Early Stopping Counter: {self.count} of {self.patience}')
+#             if self.count >= self.patience:
+#                 self.early_stop_trigger = True
+#                 print('Saving model for last epoch...')
+#                 save_model_dict(self.config, epoch, model, modality, optimizer, True)
+#                 print('Saving Model Complete')
+#                 print('Early Stopping Triggered!')
+#         else:
+#             print(f'Vehicle IoU increased from {self.min_param:.4f} ' + f'to {valid_param:.4f}')
+#             self.min_param = valid_param
+#             save_model_dict(self.config, epoch, model, modality, optimizer)
+#             print('Saving Model...')
+#             self.count = 0
+
 class EarlyStopping(object):
     def __init__(self, config):
         self.patience = config['General']['early_stop_patience']
         self.config = config
-        self.min_param = None
+
+        # 각 클래스별 최고 IoU 저장용
+        self.best_vehicle = None
+        self.best_human = None
+
         self.early_stop_trigger = False
         self.count = 0
 
-    def __call__(self, valid_param, epoch, model, modality, optimizer):
-        if self.min_param is None:
-            self.min_param = valid_param
-        elif valid_param <= self.min_param:
+    def __call__(self, veh_iou, human_iou, epoch, model, modality, optimizer):
+        """
+        veh_iou, human_iou: float (예: 0.9123)
+        """
+        # 첫 호출일 때 초기화
+        if self.best_vehicle is None:
+            self.best_vehicle = veh_iou
+            self.best_human = human_iou
+            return
+
+        improved = False
+
+        # vehicle IoU 개선 체크
+        if veh_iou > self.best_vehicle:
+            print(
+                f'Vehicle IoU increased from {self.best_vehicle:.4f} '
+                f'to {veh_iou:.4f}'
+            )
+            self.best_vehicle = veh_iou
+            improved = True
+
+        # human IoU 개선 체크
+        if human_iou > self.best_human:
+            print(
+                f'Human IoU increased from {self.best_human:.4f} '
+                f'to {human_iou:.4f}'
+            )
+            self.best_human = human_iou
+            improved = True
+
+        # 둘 중 하나라도 좋아졌으면 모델 저장 + 카운터 리셋
+        if improved:
+            save_model_dict(self.config, epoch, model, modality, optimizer)
+            print('Saving Model (IoU improved)...')
+            self.count = 0
+        else:
+            # 둘 다 좋아지지 않았으면 patience 카운트
             self.count += 1
-            print(f'Early Stopping Counter: {self.count} of {self.patience}')
+            print(
+                f'No IoU improvement. '
+                f'Counter: {self.count} of {self.patience}'
+            )
             if self.count >= self.patience:
                 self.early_stop_trigger = True
-                print('Saving model for last epoch...')
+                print('Saving model for last epoch (early stop)...')
                 save_model_dict(self.config, epoch, model, modality, optimizer, True)
                 print('Saving Model Complete')
                 print('Early Stopping Triggered!')
-        else:
-            print(f'Vehicle IoU increased from {self.min_param:.4f} ' + f'to {valid_param:.4f}')
-            self.min_param = valid_param
-            save_model_dict(self.config, epoch, model, modality, optimizer)
-            print('Saving Model...')
-            self.count = 0

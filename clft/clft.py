@@ -7,7 +7,7 @@ from einops.layers.torch import Rearrange
 
 from clft.reassemble import Reassemble
 from clft.fusion import Fusion
-from clft.head import HeadDepth, HeadSeg # , HeadAuxHuman
+from clft.head import HeadDepth, HeadSeg, HeadAuxHuman
 
 torch.manual_seed(0)
 
@@ -59,6 +59,14 @@ class CLFT(nn.Module):
         self.reassembles_XYZ = nn.ModuleList(self.reassembles_XYZ)
         self.fusions = nn.ModuleList(self.fusions)
 
+        # 보조헤드 v3
+        self.aux_lateral = nn.Sequential(
+            # stage1에서 stage0로 upsample
+            nn.Conv2d(resample_dim, resample_dim, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        )
+
         #Head
         if type == "full":
             self.head_depth = HeadDepth(resample_dim)
@@ -70,11 +78,16 @@ class CLFT(nn.Module):
             self.head_depth = None
             self.head_segmentation = HeadSeg(resample_dim, nclasses=nclasses)
             # 보조헤드
-            # self.head_aux_human = HeadAuxHuman(resample_dim)
+            self.head_aux_human = HeadAuxHuman(resample_dim)
 
     def forward(self, rgb, lidar, modal='rgb'):
         t = self.transformer_encoders(lidar)
         previous_stage = None
+        
+        # 보조헤드 v3
+        stage1 = None
+        stage0 = None
+
         for i in np.arange(len(self.fusions)-1, -1, -1):
             hook_to_take = 't'+str(self.hooks[i])
             activation_result = self.activation[hook_to_take]
@@ -90,27 +103,41 @@ class CLFT(nn.Module):
             
             fusion_result = self.fusions[i](reassemble_result_RGB, reassemble_result_XYZ, previous_stage, modal) #claude check here
             previous_stage = fusion_result
+
+            # 보조헤드 v3
+            if i==1:
+                stage1 = fusion_result
+            if i==0:
+                stage0 = fusion_result
+
         out_depth = None
         out_segmentation = None
         # 보조헤드
-        # out_aux_human = None
+        out_aux_human = None
 
         if self.head_depth != None:
             out_depth = self.head_depth(previous_stage)
         if self.head_segmentation != None:
             out_segmentation = self.head_segmentation(previous_stage)
         # 보조헤드
-        # if hasattr(self, "head_aux_human") and self.head_aux_human is not None:
-        #     out_aux_human = self.head_aux_human(previous_stage)
+        if hasattr(self, "head_aux_human") and self.head_aux_human is not None:
+            # 보조헤드 v3
+            aux_input = previous_stage # fallback
+            if (stage1 is not None) and (stage0 is not None):
+                aux_input = self.aux_lateral(stage1) + stage0
+            # v3에서 previous_stage -> aux_input
+            out_aux_human = self.head_aux_human(aux_input)
 
-        return out_depth, out_segmentation, # out_aux_human
+        return out_depth, out_segmentation, out_aux_human
 
     def _get_layers_from_hooks(self, hooks):
         def get_activation(name):
             def hook(model, input, output):
                 self.activation[name] = output
             return hook
+        # 기존
         for h in hooks:
+            # 원래 주석
             # self.transformer_encoders.layers[h].register_forward_hook(get_activation('t'+str(h)))
             self.transformer_encoders.blocks[h].register_forward_hook(get_activation('t'+str(h)))
         
