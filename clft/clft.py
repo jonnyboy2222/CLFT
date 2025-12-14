@@ -85,8 +85,12 @@ class CLFT(nn.Module):
         previous_stage = None
         
         # 보조헤드 v3
+        # stage1 = None
+        # stage0 = None
+
+        # 보조헤드 v4
+        stage2 = None
         stage1 = None
-        stage0 = None
 
         for i in np.arange(len(self.fusions)-1, -1, -1):
             hook_to_take = 't'+str(self.hooks[i])
@@ -105,10 +109,21 @@ class CLFT(nn.Module):
             previous_stage = fusion_result
 
             # 보조헤드 v3
+            # if i==1:
+            #     stage1 = fusion_result
+            # if i==0:
+            #     stage0 = fusion_result
+
+            # 보조헤드 v4
+            if i==2:
+                stage2 = fusion_result
             if i==1:
                 stage1 = fusion_result
-            if i==0:
-                stage0 = fusion_result
+
+        #dbg
+        # print(f"stage2 : {stage2.shape}")
+        # print(f"stage1 : {stage1.shape}")
+        # print(f"stage0 : {stage0.shape}")
 
         out_depth = None
         out_segmentation = None
@@ -123,9 +138,14 @@ class CLFT(nn.Module):
         if hasattr(self, "head_aux_human") and self.head_aux_human is not None:
             # 보조헤드 v3
             aux_input = previous_stage # fallback
-            if (stage1 is not None) and (stage0 is not None):
-                aux_input = self.aux_lateral(stage1) + stage0
-            # v3에서 previous_stage -> aux_input
+            # if (stage1 is not None) and (stage0 is not None):
+            #     aux_input = self.aux_lateral(stage1) + stage0
+            # v4에서 stage2 + stage1 사용
+            if (stage2 is not None) and (stage1 is not None):
+                up_stage2 = self.aux_lateral(stage2)
+                up_stage1 = self.aux_lateral(stage1)
+                aux_input = self.aux_lateral(up_stage2) + up_stage1
+            # v3에서 previous_stage -> aux_input 변경
             out_aux_human = self.head_aux_human(aux_input)
 
         return out_depth, out_segmentation, out_aux_human
