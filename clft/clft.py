@@ -59,13 +59,39 @@ class CLFT(nn.Module):
         self.reassembles_XYZ = nn.ModuleList(self.reassembles_XYZ)
         self.fusions = nn.ModuleList(self.fusions)
 
-        # 보조헤드 v3
+        # 보조헤드 v3, v4 공통
+        # self.aux_lateral = nn.Sequential(
+        #     # stage1에서 stage0로 upsample
+        #     nn.Conv2d(resample_dim, resample_dim, kernel_size=3, stride=1, padding=1),
+        #     nn.ReLU(inplace=True),
+        #     # allign_corners=False로 변경
+        #     nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+        # )
+
+        # stage1용
         self.aux_lateral = nn.Sequential(
+            # allign_corners=False로 변경
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             # stage1에서 stage0로 upsample
             nn.Conv2d(resample_dim, resample_dim, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         )
+
+        # stage2용 upsample 경로 추가
+        self.aux_lateral2 = nn.Sequential(
+            # allign_corners=False로 변경
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            # upsample 후 보정 추가
+            nn.Conv2d(resample_dim, resample_dim, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(resample_dim, resample_dim, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        # 보조헤드 v5
+        # self.aux_proj = nn.Conv2d(resample_dim, resample_dim, kernel_size=1)
 
         #Head
         if type == "full":
@@ -91,6 +117,10 @@ class CLFT(nn.Module):
         # 보조헤드 v4
         stage2 = None
         stage1 = None
+
+        # 보조헤드 v5
+        # stage2 = None
+        # stage0 = None
 
         for i in np.arange(len(self.fusions)-1, -1, -1):
             hook_to_take = 't'+str(self.hooks[i])
@@ -120,6 +150,12 @@ class CLFT(nn.Module):
             if i==1:
                 stage1 = fusion_result
 
+            # 보조헤드 v5
+            # if i==2:
+            #     stage2 = fusion_result
+            # if i==0:
+            #     stage0 = fusion_result
+
         #dbg
         # print(f"stage2 : {stage2.shape}")
         # print(f"stage1 : {stage1.shape}")
@@ -142,9 +178,16 @@ class CLFT(nn.Module):
             #     aux_input = self.aux_lateral(stage1) + stage0
             # v4에서 stage2 + stage1 사용
             if (stage2 is not None) and (stage1 is not None):
-                up_stage2 = self.aux_lateral(stage2)
-                up_stage1 = self.aux_lateral(stage1)
-                aux_input = self.aux_lateral(up_stage2) + up_stage1
+                # up_stage2 = self.aux_lateral(self.aux_lateral(stage2))
+                # up_stage1 = self.aux_lateral(stage1)
+                up_stage2 = self.aux_lateral2
+                up_stage1 = self.aux_lateral
+                aux_input = up_stage2 + up_stage1
+            # v5 stage2 + stage0
+            # if (stage2 is not None) and (stage0 is not None):
+            #     up_stage2 = self.aux_lateral(self.aux_lateral(stage2))
+            #     proj_stage0 = self.aux_proj(stage0)
+            #     aux_input = up_stage2 + proj_stage0
             # v3에서 previous_stage -> aux_input 변경
             out_aux_human = self.head_aux_human(aux_input)
 
