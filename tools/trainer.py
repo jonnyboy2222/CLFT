@@ -19,30 +19,30 @@ from utils.helpers import adjust_learning_rate_clft
 from utils.helpers import adjust_learning_rate_clfcn
 
 # focal loss
-# import torch.nn.functional as F
-# class FocalLoss(nn.Module):
-#     # increasing gamma reduces more contribution of good ones
-#     # alpha balances the importance of different classes
-#     # reduction specifies how to aggregate the loss
-#     def __init__(self, gamma=2.0, alpha=None, reduction="mean"):
-#         super().__init__()
-#         self.gamma = gamma
-#         self.alpha = alpha
-#         self.reduction = reduction
+import torch.nn.functional as F
+class FocalLoss(nn.Module):
+    # increasing gamma reduces more contribution of good ones
+    # alpha balances the importance of different classes
+    # reduction specifies how to aggregate the loss
+    def __init__(self, gamma=2.0, alpha=None, reduction="mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
 
-#     def forward(self, inputs, targets):
-#         # inputs: BCHW
-#         # targets: BHW
-#         ce_loss = F.cross_entropy(inputs, targets, reduction="none")
-#         pt = torch.exp(-ce_loss)  # pt = softmax 결과의 정답 클래스 확률
+    def forward(self, inputs, targets):
+        # inputs: BCHW
+        # targets: BHW
+        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
+        pt = torch.exp(-ce_loss)  # pt = softmax 결과의 정답 클래스 확률
 
-#         focal_loss = (1 - pt) ** self.gamma * ce_loss
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
 
-#         if self.alpha is not None:
-#             at = self.alpha[targets]
-#             focal_loss = focal_loss * at
+        if self.alpha is not None:
+            at = self.alpha[targets]
+            focal_loss = focal_loss * at
 
-#         return focal_loss.mean() if self.reduction == "mean" else focal_loss
+        return focal_loss.mean() if self.reduction == "mean" else focal_loss
 
 
 writer = SummaryWriter()
@@ -103,21 +103,21 @@ class Trainer(object):
         # )
         # self.lambda_focal = 0.5 # L = CE + 0.5 * focal
 
-        # # --- Aux human head용 focal loss 설정 ---
-        # # human class index (0:bg, 1:vehicle, 2:human 이라고 가정)
-        # self.human_class_idx = 2
+        # --- Aux human head용 focal loss 설정 ---
+        # human class index (0:bg, 1:vehicle, 2:human 이라고 가정)
+        self.human_class_idx = 2
 
-        # # aux head는 binary (non-human vs human)
-        # # alpha[0]=1.0 (non-human), alpha[1]=2.0 (human에 약간 더 가중)
-        # aux_alpha = torch.tensor([1.0, 2.0], device=self.device)
-        # self.aux_focal_loss = FocalLoss(
-        #     gamma=2.0,
-        #     alpha=aux_alpha,
-        #     reduction="mean"
-        # )
+        # aux head는 binary (non-human vs human)
+        # alpha[0]=1.0 (non-human), alpha[1]=2.0 (human에 약간 더 가중)
+        aux_alpha = torch.tensor([1.0, 2.0], device=self.device)
+        self.aux_focal_loss = FocalLoss(
+            gamma=2.0,
+            alpha=aux_alpha,
+            reduction="mean"
+        )
 
-        # # aux head loss 비율 (메인 CE 대비)
-        # self.lambda_aux = 0.5  # 나중에 0.3~1.0 사이에서 튜닝 가능
+        # aux head loss 비율 (메인 CE 대비)
+        self.lambda_aux = 0.5  # 나중에 0.3~1.0 사이에서 튜닝 가능
 
         if self.config['General']['resume_training'] is True:
             print('Resume training...')
@@ -167,7 +167,7 @@ class Trainer(object):
 
                 self.optimizer_clft.zero_grad()
                 # 보조헤드 -> aux_human_logits 추가
-                out_depth, output_seg = self.model(batch['rgb'], batch['lidar'], modality)
+                out_depth, output_seg, aux_human_logits = self.model(batch['rgb'], batch['lidar'], modality)
 
                 # 1xHxW -> HxW
                 output_seg = output_seg.squeeze(1)
@@ -179,30 +179,30 @@ class Trainer(object):
                 label_cum += batch_label
                 union_cum += batch_union
 
-                # # --- 메인 CE loss ---
-                # ce_loss = self.criterion(output_seg, anno)
+                # --- 메인 CE loss ---
+                ce_loss = self.criterion(output_seg, anno)
 
-                # # --- Aux human focal loss ---
-                # aux_loss = 0.0
-                # if aux_human_logits is not None:
-                #     # aux head 출력: [B, 2, H, W]
-                #     # target: 0 = non-human, 1 = human
-                #     target_aux = (anno == self.human_class_idx).long()
-                #     aux_loss = self.aux_focal_loss(aux_human_logits, target_aux)
+                # --- Aux human focal loss ---
+                aux_loss = 0.0
+                if aux_human_logits is not None:
+                    # aux head 출력: [B, 2, H, W]
+                    # target: 0 = non-human, 1 = human
+                    target_aux = (anno == self.human_class_idx).long()
+                    aux_loss = self.aux_focal_loss(aux_human_logits, target_aux)
 
-                #     total_loss = ce_loss + self.lambda_aux * aux_loss
-                # else:
-                #     total_loss = ce_loss
+                    total_loss = ce_loss + self.lambda_aux * aux_loss
+                else:
+                    total_loss = ce_loss
 
-                # train_loss += total_loss.item()
-                # total_loss.backward()
-                # self.optimizer_clft.step()
-                # progress_bar.set_description(
-                #     f'CLFT train loss:{total_loss:.4f}'
-                # )
+                train_loss += total_loss.item()
+                total_loss.backward()
+                self.optimizer_clft.step()
+                progress_bar.set_description(
+                    f'CLFT train loss:{total_loss:.4f}'
+                )
 
                 # 기존
-                loss = self.criterion(output_seg, batch['anno'])
+                # loss = self.criterion(output_seg, batch['anno'])
                 
                 # 원래 주석
                 # w_rgb = 1.1
@@ -230,10 +230,10 @@ class Trainer(object):
                 # loss = ce + self.lambda_focal * focal_human
                 
                 # 기존
-                train_loss += loss.item()
-                loss.backward()
-                self.optimizer_clft.step()
-                progress_bar.set_description(f'CLFT train loss:{loss:.4f}')
+                # train_loss += loss.item()
+                # loss.backward()
+                # self.optimizer_clft.step()
+                # progress_bar.set_description(f'CLFT train loss:{loss:.4f}')
 
             # The IoU of one epoch
             train_epoch_IoU = overlap_cum / union_cum
@@ -255,8 +255,12 @@ class Trainer(object):
                                              'valid': valid_epoch_IoU[1]}, epoch)
             writer.close()
 
-            early_stop_index = round(valid_epoch_IoU[0].item(), 4)
-            early_stopping(early_stop_index, epoch, self.model, modality, self.optimizer_clft)
+            # early_stop_index = round(valid_epoch_IoU[0].item(), 4) # vehicle iou 넘겨주는 부분
+            veh_iou = round(valid_epoch_IoU[0].item(), 4)   # vehicle IoU
+            human_iou = round(valid_epoch_IoU[1].item(), 4) # human IoU
+
+            early_stopping(veh_iou, human_iou, epoch, self.model, modality, self.optimizer_clft)
+
             save_epoch = self.config['General']['save_epoch']
             if (epoch + 1) % save_epoch == 0 and epoch > 0:
                 print(f'Saving model for every {save_epoch} epochs...')
@@ -282,7 +286,7 @@ class Trainer(object):
                 batch['anno'] = batch['anno'].to(self.device, non_blocking=True)
 
                 # 보조헤드 추가 -> aux_human_logits
-                out_depth, output_seg = self.model(batch['rgb'], batch['lidar'], modal)
+                out_depth, output_seg, aux_human_logits = self.model(batch['rgb'], batch['lidar'], modal)
                 # 1xHxW -> HxW
                 output_seg = output_seg.squeeze(1)
                 anno = batch['anno']
@@ -295,21 +299,21 @@ class Trainer(object):
                 union_cum += batch_union
 
                 # 기존
-                loss = self.criterion(output_seg, batch['anno'])
+                # loss = self.criterion(output_seg, batch['anno'])
 
-                # # --- 메인 CE loss ---
-                # ce_loss = self.criterion(output_seg, anno)
+                # --- 메인 CE loss ---
+                ce_loss = self.criterion(output_seg, anno)
 
-                # # --- Aux human focal loss ---
-                # if aux_human_logits is not None:
-                #     target_aux = (anno == self.human_class_idx).long()
-                #     aux_loss = self.aux_focal_loss(aux_human_logits, target_aux)
-                #     total_loss = ce_loss + self.lambda_aux * aux_loss
-                # else:
-                #     total_loss = ce_loss
+                # --- Aux human focal loss ---
+                if aux_human_logits is not None:
+                    target_aux = (anno == self.human_class_idx).long()
+                    aux_loss = self.aux_focal_loss(aux_human_logits, target_aux)
+                    total_loss = ce_loss + self.lambda_aux * aux_loss
+                else:
+                    total_loss = ce_loss
 
-                # valid_loss += total_loss.item()
-                # progress_bar.set_description(f'valid fusion loss: {total_loss:.4f}')
+                valid_loss += total_loss.item()
+                progress_bar.set_description(f'valid fusion loss: {total_loss:.4f}')
 
                 # # focal loss
                 # # 1) 기본 ce loss
@@ -332,8 +336,8 @@ class Trainer(object):
                 # loss = ce + self.lambda_focal * focal_human
 
                 # 기존
-                valid_loss += loss.item()
-                progress_bar.set_description(f'valid fusion loss: {loss:.4f}')
+                # valid_loss += loss.item()
+                # progress_bar.set_description(f'valid fusion loss: {loss:.4f}')
         # The IoU of one epoch
         valid_epoch_IoU = overlap_cum / union_cum
         print(f'Validation vehicles IoU for Epoch: {valid_epoch_IoU[0]:.4f}')

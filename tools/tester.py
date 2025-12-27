@@ -43,6 +43,15 @@ class Tester(object):
                               model_timm=config['CLFT']['model_timm'], )
             print(f'Using backbone {args.backbone}')
 
+            # swin용
+            # dummy forward로 conv1 실제 생성
+            # self.model.to(self.device)
+            # self.model.eval()
+            # with torch.no_grad():
+            #     dummy_rgb = torch.zeros(1, 3, resize, resize, device=self.device)
+            #     dummy_lidar = torch.zeros(1, 3, resize, resize, device=self.device)
+            #     _ = self.model(dummy_rgb, dummy_lidar, "cross_fusion")  # 여기서 reassemble.resample.conv1들이 다 만들어짐
+
             model_path = config['General']['model_path']
             self.model.load_state_dict(torch.load(model_path, map_location=self.device)['model_state_dict'])
 
@@ -72,7 +81,8 @@ class Tester(object):
                 batch['lidar'] = batch['lidar'].to(self.device, non_blocking=True)
                 batch['anno'] = batch['anno'].to(self.device, non_blocking=True)
 
-                _, output_seg = self.model(batch['rgb'], batch['lidar'], modality)
+                # 보조헤드 -> aux_human_logits 추가
+                _, output_seg, aux_human_logits = self.model(batch['rgb'], batch['lidar'], modality)
 
                 # 1xHxW -> HxW
                 output_seg = output_seg.squeeze(1)

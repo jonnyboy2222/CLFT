@@ -5,9 +5,9 @@ import timm
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
-from clft.reassemble import Reassemble
-from clft.fusion import Fusion
-from clft.head import HeadDepth, HeadSeg, HeadAuxHuman
+from reassemble import Reassemble
+from fusion import Fusion
+from head import HeadDepth, HeadSeg, HeadAuxHuman
 
 torch.manual_seed(0)
 
@@ -70,36 +70,6 @@ class CLFT(nn.Module):
 
         # ups v1
         # stage1용
-        self.aux_lateral = nn.Sequential(
-            nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
-            nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
-            nn.ReLU(inplace=True),
-
-            # allign_corners=False로 변경
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(resample_dim, resample_dim, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-        )
-
-        # stage2용 upsample 경로 추가
-        self.aux_lateral2 = nn.Sequential(
-            nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
-            nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
-            nn.ReLU(inplace=True),
-
-            # allign_corners=False로 변경
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(resample_dim, resample_dim, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(resample_dim, resample_dim, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-        )
-
-        # ups v2
-        # 모든 conv -> dw + pw
-        # stage1용
         # self.aux_lateral = nn.Sequential(
         #     nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
         #     nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
@@ -107,8 +77,7 @@ class CLFT(nn.Module):
 
         #     # allign_corners=False로 변경
         #     nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-        #     nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
-        #     nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
+        #     nn.Conv2d(resample_dim, resample_dim, kernel_size=3, stride=1, padding=1),
         #     nn.ReLU(inplace=True),
         # )
 
@@ -120,23 +89,54 @@ class CLFT(nn.Module):
 
         #     # allign_corners=False로 변경
         #     nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-        #     nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
-        #     nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
+        #     nn.Conv2d(resample_dim, resample_dim, kernel_size=3, stride=1, padding=1),
         #     nn.ReLU(inplace=True),
 
         #     nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-        #     nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
-        #     nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
+        #     nn.Conv2d(resample_dim, resample_dim, kernel_size=3, stride=1, padding=1),
         #     nn.ReLU(inplace=True),
         # )
 
         # ups v2
+        # 모든 conv -> dw + pw
+        # stage1용
+        self.aux_lateral = nn.Sequential(
+            nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
+            nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
+            nn.ReLU(inplace=True),
+
+            # allign_corners=False로 변경
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
+            nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
+            nn.ReLU(inplace=True),
+        )
+
+        # stage2용 upsample 경로 추가
+        self.aux_lateral2 = nn.Sequential(
+            nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
+            nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
+            nn.ReLU(inplace=True),
+
+            # allign_corners=False로 변경
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
+            nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
+            nn.ReLU(inplace=True),
+
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
+            nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
+            nn.ReLU(inplace=True),
+        )
+
+        # ups v2
         # main head용 upsample 후 정렬
-        # self.main_lateral = nn.Sequential(
-        #     nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
-        #     nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
-        #     nn.ReLU(inplace=True)
-        # )
+        self.main_lateral = nn.Sequential(
+            nn.Conv2d(resample_dim, resample_dim, 3, padding=1, groups=resample_dim, bias=True),
+            nn.Conv2d(resample_dim, resample_dim, 1, bias=True),
+            nn.ReLU(inplace=True)
+        )
 
         # ups v3
         # stage1용
@@ -252,13 +252,13 @@ class CLFT(nn.Module):
             out_depth = self.head_depth(previous_stage)
         if self.head_segmentation != None:
             # 기존
-            out_segmentation = self.head_segmentation(previous_stage)
+            # out_segmentation = self.head_segmentation(previous_stage)
 
             # ups v2
             # main head에 들어가는 input에 정렬용 conv 적용
-            # last_stage = previous_stage
-            # main_head_input = self.main_lateral(last_stage)
-            # out_segmentation = self.head_segmentation(main_head_input)
+            last_stage = previous_stage
+            main_head_input = self.main_lateral(last_stage)
+            out_segmentation = self.head_segmentation(main_head_input)
 
         # 보조헤드
         if hasattr(self, "head_aux_human") and self.head_aux_human is not None:
@@ -275,12 +275,12 @@ class CLFT(nn.Module):
                 up_stage2 = self.aux_lateral2(stage2)
                 up_stage1 = self.aux_lateral(stage1)
                 aux_input = up_stage2 + up_stage1
-            # v5 stage2 + stage0
+            # focal v5 stage2 + stage0
             # if (stage2 is not None) and (stage0 is not None):
             #     up_stage2 = self.aux_lateral(self.aux_lateral(stage2))
             #     proj_stage0 = self.aux_proj(stage0)
             #     aux_input = up_stage2 + proj_stage0
-            # v3에서 previous_stage -> aux_input 변경
+            # focal v3에서 previous_stage -> aux_input 변경
             out_aux_human = self.head_aux_human(aux_input)
 
         return out_depth, out_segmentation, out_aux_human
