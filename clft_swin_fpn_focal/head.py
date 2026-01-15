@@ -1,0 +1,96 @@
+import numpy as np
+import torch
+import torch.nn as nn
+
+
+class Interpolate(nn.Module):
+    def __init__(self, scale_factor, mode, align_corners=False):
+        super(Interpolate, self).__init__()
+        self.interp = nn.functional.interpolate
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.align_corners = align_corners
+
+    def forward(self, x):
+        x = self.interp(
+            x,
+            scale_factor=self.scale_factor,
+            mode=self.mode,
+            align_corners=self.align_corners)
+        return x
+
+
+class HeadDepth(nn.Module):
+    def __init__(self, features):
+        super(HeadDepth, self).__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(features, features // 2, kernel_size=3, stride=1, padding=1),
+            # allign_corners=False로 변경
+            Interpolate(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(features // 2, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0),
+            # nn.ReLU()
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.head(x)
+        # x = (x - x.min())/(x.max()-x.min() + 1e-15)
+        return x
+
+
+class HeadSeg(nn.Module):
+    def __init__(self, features, nclasses=2):
+        super(HeadSeg, self).__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(features, features // 2, kernel_size=3, stride=1, padding=1),
+            # allign_corners=False로 변경
+            Interpolate(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(features // 2, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, nclasses, kernel_size=1, stride=1, padding=0)
+        )
+
+    def forward(self, x):
+        x = self.head(x)
+        return x
+
+
+# 보조헤드
+class HeadAuxHuman(nn.Module):
+    """
+    Human 전용 보조 헤드
+    - 출력: 2채널 (0 = non-human, 1 = human)
+    - main head와 같은 해상도에서 돌아가는 가벼운 decoder
+    """
+    def __init__(self, features):
+        super(HeadAuxHuman, self).__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(features, features // 2, kernel_size=3, stride=1, padding=1),
+            # align_corners=False로 변경
+            Interpolate(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(features // 2, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 2, kernel_size=1, stride=1, padding=0)  # binary: non-human, human
+        )
+
+    def forward(self, x):
+        x = self.head(x)
+        return x
+
+# (expand and reduce)
+# class ASPP(nn.Module):
+#     def __init__(self, in_channels, out_channels):
+#         super().__init__()
+#         self.blocks = nn.ModuleList([
+#             nn.Conv2d(in_channels, out_channels, 1),
+#             nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6),
+#             nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12),
+#             nn.Conv2d(in_channels, out_channels, 3, padding=18, dilation=18),
+#         ])
+#         self.output = nn.Conv2d(out_channels * 4, out_channels, 1)
+
+#     def forward(self, x):
+#         out = [block(x) for block in self.blocks]
+#         return self.output(torch.cat(out, dim=1))
