@@ -14,7 +14,6 @@ class CTCA(nn.Module):
 
     Output:
       delta: (B, Nq, D)  # semantic proposal (Δ)
-      (optional) attn: (B, H, Nq, Nk)
     """
     def __init__(
         self,
@@ -22,7 +21,6 @@ class CTCA(nn.Module):
         num_heads: int = 32,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        return_attn: bool = False,
     ):
         super().__init__()
         assert emb_dim % num_heads == 0, "emb_dim must be divisible by num_heads"
@@ -30,8 +28,6 @@ class CTCA(nn.Module):
         self.num_heads = num_heads
         self.head_dim = emb_dim // num_heads
         self.scale = self.head_dim ** -0.5
-
-        self.return_attn = return_attn
 
         # Pre-LN (recommended for stability)
         self.norm_q = nn.LayerNorm(emb_dim)
@@ -54,7 +50,6 @@ class CTCA(nn.Module):
 
         Returns:
           delta: (B, Nq, D)
-          attn (optional): (B, H, Nq, Nk)
         """
         B, Nq, D = q_tokens.shape
         B2, Nk, D2 = kv_tokens.shape
@@ -90,11 +85,8 @@ class CTCA(nn.Module):
         out = self.out_proj(out)
         out = self.proj_drop(out)
 
-        # Residual: IMPORTANT
-        # CTCA output is a "proposal", but we still return it as delta;
-        # the actual update L' = L + (m*g)*delta should happen outside.
         delta = out  # (B, Nq, D)
 
-        if self.return_attn:
-            return delta, attn
+        # if self.return_attn:
+        #     return delta, attn
         return delta

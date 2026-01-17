@@ -20,20 +20,22 @@ class CTSA(nn.Module):
 
         self.emb_dim = emb_dim
         self.num_heads = num_heads
-        self.head_dim = emb_dim // num_heads
+        self.head_dim = emb_dim // num_heads # head dim in integer
         self.scale = self.head_dim ** -0.5
 
-        # Standard: one linear that produces qkv together (more efficient)
+        # efficiently make qkv at the same time (and split later)
         self.qkv = nn.Linear(emb_dim, 3 * emb_dim, bias=use_bias)
 
         self.attn_drop = nn.Dropout(attn_drop)
+        # multi head: linear projection after merging
         self.proj = nn.Linear(emb_dim, emb_dim, bias=use_bias)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        # 안정성을 위한 layer norm
         self.use_ln = use_ln
         self.ln = nn.LayerNorm(emb_dim) if use_ln else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         """
         x: (B, T, D)
         """
@@ -41,13 +43,13 @@ class CTSA(nn.Module):
         B, T, D = x.shape
         assert D == self.emb_dim, f"Expected last dim {self.emb_dim}, got {D}"
 
-        # Pre-LN for stability (recommended)
+        # layer norm
         x_in = x
         x = self.ln(x)
 
         # qkv: (B, T, 3D) -> (B, T, 3, H, Dh) -> (3, B, H, T, Dh)
         qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each: (B, H, T, Dh)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, T, Dh) for each
 
         # scores: (B, H, T, T)
         attn_scores = (q @ k.transpose(-2, -1)) * self.scale
