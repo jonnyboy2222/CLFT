@@ -32,15 +32,15 @@ class CWT(nn.Module):
 
 
 # check
-if __name__ == "__main__":
-    B, N, D = 2, 197, 768  # ViT: 1 cls token + 196 patches
-    x = torch.randn(B, N, D)
+# if __name__ == "__main__":
+#     B, N, D = 2, 197, 768  # ViT: 1 cls token + 196 patches
+#     x = torch.randn(B, N, D)
 
-    cwt = CWT()
-    t, a = cwt(x)
+#     cwt = CWT()
+#     t, a = cwt(x)
 
-    print("x shape:", x.shape)
+#     print("x shape:", x.shape)
 
-    print("T:", t.shape)  # (B, 3, 768)
-    print("A:", a.shape)  # (B, N-1, 3)
-    print("sum over tokens:", a.sum(dim=1)[0])  # add up to 1
+#     print("T:", t.shape)  # (B, 3, 768)
+#     print("A:", a.shape)  # (B, N-1, 3)
+#     print("sum over tokens:", a.sum(dim=1)[0])  # add up to 1
