@@ -99,3 +99,29 @@ def apply_patch_mask_to_update(delta: torch.Tensor, gate: torch.Tensor, mask: to
     # Broadcast to (B,N,D) safely
     masked = delta * gate * mask
     return masked
+
+def apply_token_mask_to_vit_emb(emb: torch.Tensor, mask_tok: torch.Tensor):
+    """
+    emb: (B, 1+N, D)  (CLS + patch tokens)
+    mask_tok: (B, N, 1)  patch token mask (CLS 제외)
+    return: (B, 1+N, D)  CLS 고정, patch만 마스킹
+    """
+    if mask_tok is None:
+        return emb
+
+    cls = emb[:, :1, :]     # (B,1,D)
+    tok = emb[:, 1:, :]     # (B,N,D)
+
+    # shape check
+    if mask_tok.dim() == 2:
+        m = mask_tok.unsqueeze(-1)  # (B,N,1)
+    else:
+        m = mask_tok
+    if m.shape[1] != tok.shape[1]:
+        raise RuntimeError(f"mask_tok N={m.shape[1]} != token N={tok.shape[1]}")
+
+    m = m.to(device=tok.device, dtype=tok.dtype)  # fp16/amp 안전
+    tok = tok * m                                  # hard invalidate
+
+    return torch.cat([cls, tok], dim=1)
+

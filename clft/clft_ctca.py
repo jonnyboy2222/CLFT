@@ -42,7 +42,7 @@ class CTCA(nn.Module):
         self.out_proj = nn.Linear(emb_dim, emb_dim, bias=True)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, q_tokens: torch.Tensor, kv_tokens: torch.Tensor):
+    def forward(self, q_tokens, kv_tokens, q_mask=None):
         """
         Args:
           q_tokens:  (B, Nq, D)  LiDAR patch tokens (CLS excluded)
@@ -86,6 +86,16 @@ class CTCA(nn.Module):
         out = self.proj_drop(out)
 
         delta = out  # (B, Nq, D)
+
+        # ---- Query mask hard-apply: masked queries produce delta=0 ----
+        if q_mask is not None:
+            m = q_mask
+            if m.dim() == 2:
+                m = m.unsqueeze(-1)  # (B, Nq, 1)
+            if m.shape[0] != B or m.shape[1] != Nq:
+                raise ValueError(f"[CTCA] q_mask shape {tuple(m.shape)} must match (B,Nq,1)={(B,Nq,1)}")
+            m = m.to(device=delta.device, dtype=delta.dtype)
+            delta = delta * m
 
         # if self.return_attn:
         #     return delta, attn

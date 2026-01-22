@@ -12,7 +12,7 @@ from clft.head import HeadDepth, HeadSeg
 from clft.clft_cwt import CWT
 from clft.clft_ctsa import CTSA
 from clft.clft_ctca import CTCA
-from clft.clft_mask import patch_mask_from_lidar
+from clft.clft_mask import patch_mask_from_lidar, apply_token_mask_to_vit_emb
 
 torch.manual_seed(0)
 
@@ -135,7 +135,7 @@ class CLFT(nn.Module):
 
                 if i == 2:
                     cwt_cam2 = self.cwt(activation_result_rgb)
-                    cwt_xyz2 = self.cwt(activation_result_xyz)
+                    cwt_xyz2 = self.cwt(activation_result_xyz, mask_tok)        # lidar에서만 mask 적용
                     cls_token_stage2 = torch.cat([cwt_cam2, cwt_xyz2], dim=1)   # (B, 2K, D) 같은 형태
                     ctsa_out2 = self.ctsa(cls_token_stage2)                     # (B, Nk, D)  Nk=2K
 
@@ -143,7 +143,7 @@ class CLFT(nn.Module):
                     cls_xyz2 = activation_result_xyz[:, :1, :]                  # (B,1,D)  CLS 고정
                     L2 = activation_result_xyz[:, 1:, :]                        # (B,N,D)
 
-                    delta2 = self.ctca(L2, ctsa_out2)                           # (B,N,D)  Δ
+                    delta2 = self.ctca(L2, ctsa_out2, mask_tok)                 # (B,N,D)  Δ, mask 적용
 
                     # g = sigmoid(Linear([L, Δ, M]))
                     if mask_tok is None:
@@ -160,14 +160,14 @@ class CLFT(nn.Module):
 
                 elif i == 0:
                     cwt_cam0 = self.cwt(activation_result_rgb)
-                    cwt_xyz0 = self.cwt(activation_result_xyz)
+                    cwt_xyz0 = self.cwt(activation_result_xyz, mask_tok)        # mask 적용
                     cls_token_stage0 = torch.cat([cwt_cam0, cwt_xyz0], dim=1)
                     ctsa_out0 = self.ctsa(cls_token_stage0)
 
                     cls_xyz0 = activation_result_xyz[:, :1, :]
                     L0 = activation_result_xyz[:, 1:, :]
 
-                    delta0 = self.ctca(L0, ctsa_out0)
+                    delta0 = self.ctca(L0, ctsa_out0, mask_tok)                 # mask 적용
 
                     gate_in0 = torch.cat([L0, delta0, mask_tok], dim=-1)
                     g0 = torch.sigmoid(self.gate_proj(gate_in0))
@@ -178,9 +178,20 @@ class CLFT(nn.Module):
                     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
                     reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz_updated)
 
+                # else:
+                #     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
+                #     reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz)
+
                 else:
+                    # stage 3,1에서는 CWT/CTCA 없이 token-level denoise만 적용
+                    if i in [3, 1]:
+                        activation_result_xyz_masked = apply_token_mask_to_vit_emb(activation_result_xyz, mask_tok)
+                    else:
+                        activation_result_xyz_masked = activation_result_xyz
+
                     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
-                    reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz)
+                    reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz_masked)
+
 
 
             elif modal == 'rgb':

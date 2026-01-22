@@ -19,13 +19,41 @@ class CWT(nn.Module):
             nn.Linear(hidden, num_classes)
         )
          
-    def forward(self, x, has_cls_token=True):
+    def forward(self, x, mask_tok=None, has_cls_token=True):
         # x: (B, N, D)
         x_token = x[:, 1:, :] if has_cls_token else x  # (B, N, D)
+        B, N, D = x_token.shape
 
         s = self.simple_mlp(x_token)          # (B, N, K) k: class score
-        a = F.softmax(s, dim=1)               # (B, N, K) k: class index
-        # relative class-wise prob of n^th token
+        # a = F.softmax(s, dim=1)               # (B, N, K) k: class index
+        # # relative class-wise prob of n^th token
+
+        if mask_tok is None:
+            # normal token-competition over tokens
+            a = F.softmax(s, dim=1)  # (B, Np, K)
+        else:
+            m = mask_tok
+            if m.dim() == 2:
+                m = m.unsqueeze(-1)  # (B, Np, 1)
+            if m.shape[0] != B or m.shape[1] != N:
+                raise ValueError(
+                    f"[CWT] mask_tok shape {tuple(m.shape)} must match (B,Np,1)={(B,N,1)}"
+                )
+            m = m.to(device=s.device, dtype=torch.float32)
+
+            # 1) hard-exclude invalid tokens in logits BEFORE softmax
+            #    -> masked tokens get ~0 probability after softmax
+            s_masked = s.float().masked_fill(m == 0, -1e4)
+
+            # 2) softmax over tokens (dim=1)
+            a = F.softmax(s_masked, dim=1)  # (B, Np, K)
+
+            # 3) enforce exact zero on masked tokens, then renormalize over valid tokens
+            a = a * m
+            denom = a.sum(dim=1, keepdim=True).clamp_min(1e-6)  # (B,1,K)
+            a = a / denom
+
+            a = a.to(dtype=s.dtype)
 
         cls_token = torch.bmm(a.transpose(1, 2), x_token)  # (B, K, D)
         return cls_token # , a
