@@ -122,6 +122,15 @@ class CLFT(nn.Module):
             # patch_size는 __init__ 인자로 들어온 그 patch_size를 그대로 사용
             mask_tok = patch_mask_from_lidar(lidar, patch_size=16, eps=0.0, dtype=torch.float32)  # (B,N,1)
 
+        # mask token을 2d로 바꾸기 위해 grid 사이즈 구하기
+        mask_2d = None
+        Hp = Wp = None
+        if mask_tok is not None:
+            B, C, H, W = lidar.shape
+            P = 16  # 지금 patch_mask_from_lidar에서 patch_size=16으로 고정했으니 동일하게
+            Hp, Wp = H // P, W // P
+            # (B,N,1) -> (B,1,Hp,Wp)
+            mask_2d = mask_tok.view(B, Hp, Wp, 1).permute(0, 3, 1, 2).contiguous()  # float(0/1)
 
         previous_stage = None
 
@@ -178,19 +187,19 @@ class CLFT(nn.Module):
                     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
                     reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz_updated)
 
-                # else:
-                #     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
-                #     reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz)
-
                 else:
-                    # stage 3,1에서는 CWT/CTCA 없이 token-level denoise만 적용
-                    if i in [3, 1]:
-                        activation_result_xyz_masked = apply_token_mask_to_vit_emb(activation_result_xyz, mask_tok)
-                    else:
-                        activation_result_xyz_masked = activation_result_xyz
-
                     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
-                    reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz_masked)
+                    reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz)
+
+                # else:
+                #     # stage 3,1에서는 CWT/CTCA 없이 token-level denoise만 적용
+                #     if i in [3, 1]:
+                #         activation_result_xyz_masked = apply_token_mask_to_vit_emb(activation_result_xyz, mask_tok)
+                #     else:
+                #         activation_result_xyz_masked = activation_result_xyz
+
+                #     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
+                #     reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz_masked)
 
 
 
@@ -204,7 +213,16 @@ class CLFT(nn.Module):
                 reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result)
                 reassemble_result_RGB = torch.zeros_like(reassemble_result_XYZ)
 
-            fusion_result = self.fusions[i](reassemble_result_RGB, reassemble_result_XYZ, previous_stage, modal)
+            # reassemble_result_XYZ의 해상도와 맞춰주기
+            M_stage = None
+            if modal == "cross_fusion" and mask_2d is not None:
+                Hs, Ws = reassemble_result_XYZ.shape[-2], reassemble_result_XYZ.shape[-1]
+                # nearest: 0/1 마스크 보존
+                M_stage = torch.nn.functional.interpolate(mask_2d, size=(Hs, Ws), mode="nearest")
+
+            fusion_result = self.fusions[i](reassemble_result_RGB, reassemble_result_XYZ, previous_stage, modal, M_stage)
+
+            # fusion_result = self.fusions[i](reassemble_result_RGB, reassemble_result_XYZ, previous_stage, modal)
             previous_stage = fusion_result
 
         out_depth = None
