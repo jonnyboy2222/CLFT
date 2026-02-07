@@ -28,7 +28,7 @@ class ResidualConvUnit(nn.Module):
 
 
 class Fusion(nn.Module):
-    def __init__(self, resample_dim, alpha=0.15):
+    def __init__(self, resample_dim, alpha=0.10):
         super(Fusion, self).__init__()
         #self.res_conv1 = ResidualConvUnit(resample_dim)
         self.res_conv_xyz = ResidualConvUnit(resample_dim)
@@ -44,10 +44,10 @@ class Fusion(nn.Module):
         self.gate_conv = nn.Conv2d(2 * resample_dim + 1, 1, kernel_size=1, bias=True)
 
         # logging
-        # self.last_log = {
-        #     "g": None,
-        #     "scale": None
-        # }
+        self.last_log = {
+            "g": None,
+            "scale": None
+        }
     
 
     def forward(self, rgb, lidar, previous_stage=None, modal = 'rgb', mask=None):
@@ -90,15 +90,18 @@ class Fusion(nn.Module):
             gate_in = torch.cat([C, Lp, mask], dim=1)      # (B,2D+1,H,W)
             g = torch.sigmoid(self.gate_conv(gate_in))     # (B,1,H,W)
 
+            # gate map
+            # self.last_gate_map = g.detach()
+
             scale = self.alpha + (1.0 - self.alpha) * g    # (B,1,H,W)
             Fused = C + scale * (mask * Lp)       
 
             # logging
             # if self.training:  # train 때만
-            #     with torch.no_grad():
-            #         # scalar로 저장 (gpu tensor -> python float)
-            #         self.last_log["g"] = float(g.mean().item())
-            #         self.last_log["scale"] = float(scale.mean().item())
+            # with torch.no_grad():
+            #     # scalar로 저장 (gpu tensor -> python float)
+            #     self.last_log["g"] = float(g.mean().item())
+            #     self.last_log["scale"] = float(scale.mean().item())
 
 
         # output_stage1 = output_stage1_lidar + output_stage1_rgb + previous_stage

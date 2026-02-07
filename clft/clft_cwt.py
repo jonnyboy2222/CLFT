@@ -55,6 +55,8 @@ class CWT(nn.Module):
 
             a = a.to(dtype=s.dtype)
 
+        a = F.softmax(s, dim=1)  # (B, Np, K)
+
         cls_token = torch.bmm(a.transpose(1, 2), x_token)  # (B, K, D)
         return cls_token # , a
 
