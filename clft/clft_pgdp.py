@@ -62,7 +62,7 @@ class PGDP(nn.Module):
         conv2_ref1 = self.proj2a(conv2_up_s1)
         # stage0과 합칠 feature
         conv2_up_s0 = F.interpolate(conv2_ref1, size=stage0.shape[-2:])
-        conv2_ref0 = self.proj2b(conv2_up_s0)
+        conv2_ref0 = self.proj2b(conv2_up_s0) # ref : refined
         
 
         '''stage1'''
