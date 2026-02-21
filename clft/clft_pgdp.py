@@ -86,8 +86,9 @@ class PGDP(nn.Module):
         fused_all = self.proj_f1(fused_all)
         # M_pd0
         p0 = torch.sigmoid(fused_all)
+        p0_fg = p0.max(dim=1, keepdim=True).values   # (B,1,H0,W0) : apply용
 
-        y2 = stage0 * (1 + p0)
+        y2 = stage0 * (1 + p0_fg) # 학습은 채널별(클래스별), 증폭은 합쳐서 수행
 
         return p2, p1, p0, y2
 
