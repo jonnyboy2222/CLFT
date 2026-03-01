@@ -10,7 +10,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from clfcn.fusion_net import FusionNet
 from utils.metrics import find_overlap
 from utils.metrics import auc_ap
-from clft.clft import CLFT
+from clft_ctca_fusion.clft import CLFT
 
 
 class Tester(object):

@@ -22,6 +22,10 @@ from torch.amp import autocast, GradScaler
 import os, csv
 from pathlib import Path
 
+from tools.clft_pgdp_gt import PGDPBuilderGT
+from tools.clft_pgdp_loss import PGDPLoss
+from tools.clft_pgdp_loss import dice_loss_softmax
+
 
 writer = SummaryWriter()
 
@@ -36,9 +40,56 @@ class Trainer(object):
                                    if torch.cuda.is_available() else "cpu")
         print("device: %s" % self.device)
 
+        # pgdp gt&loss
+        self.pgdp_gt_builder = PGDPBuilderGT(refine=True)
+        self.pgdp_loss_fn = PGDPLoss()
+
+        self.pfim_lambda = 0.01
+        self.pgdp_lambda = 0.1
+
+        # human-only dice
+        self.dice_lambda = 0.1  
+        self.human_class_id = 2
+
         # 메모리 절약
-        self.use_amp = True
+        self.use_amp = False
         self.scaler = GradScaler(enabled=self.use_amp)
+
+        # ===== Logs directory (relative to trainer.py) =====
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.logs_dir = os.path.abspath(os.path.join(base_dir, "../logs"))
+        self.log_path = os.path.join(self.logs_dir, "pp_diagnostics.csv")
+
+        self.pp_csv_header = [
+            "epoch",
+            "pfim_loss",
+            "pgdp_total",
+            "info_mean",
+            "info_std",
+            "info_p95",
+            "info_p95_max",
+            "pfim_gain_mean",
+            "pfim_gain_p95",
+            "pfim_gain_p95_max",
+            "pfim_p_mean",
+            "pfim_clamp_ratio",
+            "pfim_mae_mu_x",
+            "p0_mean",
+            "p0_p95",
+            "p0_p95_max",
+            "pgdp_p0_fg_min",
+            "pgdp_p0_fg_max",
+            "delta_ratio",
+            "y1_ratio",
+            "y2_ratio",
+            "pix_ratio_h",
+            "pix_ratio_v",
+        ]
+
+        if not os.path.exists(self.log_path):
+            with open(self.log_path, "w", newline="") as f:
+                csv_writer = csv.writer(f)
+                csv_writer.writerow(self.pp_csv_header)
 
         if args.backbone == 'clfcn':
             self.model = FusionNet()
@@ -118,6 +169,29 @@ class Trainer(object):
             overlap_cum, pred_cum, label_cum, union_cum = 0, 0, 0, 0
             progress_bar = tqdm(train_dataloader)
 
+            # ===== PFIM/PGDP epoch diagnostics accumulator =====
+            diag_sum = {k: 0.0 for k in self.pp_csv_header if k != "epoch"}
+            diag_cnt = 0
+
+            # epoch 내 runaway/포화를 놓치지 않기 위한 max tracker
+            diag_max = {
+                "info_p95_max": 0.0,
+                "pfim_gain_p95_max": 0.0,
+                "p0_p95_max": 0.0,
+                "pgdp_p0_fg_max": 0.0,
+            }
+
+            def _sf(x, default=0.0):
+                # safe float
+                try:
+                    if x is None:
+                        return default
+                    if torch.is_tensor(x):
+                        return float(x.detach().item())
+                    return float(x)
+                except Exception:
+                    return default
+
             for i, batch in enumerate(progress_bar):
                 batch['rgb'] = batch['rgb'].to(self.device, non_blocking=True)
                 batch['lidar'] = batch['lidar'].to(self.device, non_blocking=True)
@@ -126,14 +200,14 @@ class Trainer(object):
                 self.optimizer_clft.zero_grad(set_to_none=True)
 
                 with autocast(enabled=self.use_amp, device_type="cuda"):
-                    _, output_seg = self.model(batch['rgb'], batch['lidar'], modality)
-
+                    _, output_seg, extras = self.model(batch['rgb'], batch['lidar'], modality)
 
                 # 1xHxW -> HxW
                 # output_seg = output_seg.squeeze(1)
                 anno = batch['anno']
                 if anno.ndim == 4 and anno.size(1) == 1:
                     anno = anno.squeeze(1)   # (B,1,H,W)->(B,H,W)
+
 
                 with torch.no_grad():
                     pred_for_metric = output_seg.detach().float()
@@ -144,7 +218,185 @@ class Trainer(object):
                 union_cum += batch_union
 
                 with autocast(enabled=self.use_amp, device_type="cuda"):
-                    loss = self.criterion(output_seg, anno)
+                    ce_loss = self.criterion(output_seg, anno)
+
+                    # human-only Dice
+                    # dice_loss = dice_loss_softmax(
+                    #     logits=output_seg,
+                    #     target=anno,
+                    #     class_id=self.human_class_id,
+                    #     ignore_index=4,
+                    # )
+
+                    # dice_applied = self.dice_lambda * dice_loss
+
+                    # PFIM loss (scalar)
+                    pfim_loss = extras["pfim_loss"]
+
+                    # PGDP GT & loss
+                    gt = self.pgdp_gt_builder(anno)              # {"M_gt","weights","valid"}
+                    pgdp_loss, pgdp_logs = self.pgdp_loss_fn(
+                        extras["p2"], extras["p1"], extras["p0"], gt
+                    )                                           # returns (total, logs)
+
+                    pfim_applied = self.pfim_lambda * pfim_loss
+                    pgdp_applied = self.pgdp_lambda * pgdp_loss
+
+
+                    # total
+                    # loss = ce_loss + dice_applied + pfim_applied + pgdp_applied
+
+                    loss = ce_loss + pfim_applied + pgdp_applied
+
+                    # # ===== Human stabilization losses (FP suppression + Dice) =====
+                    # HUMAN_ID = 2
+
+                    # lambda_absent = 0.05   # GT에 human 없는 이미지에서 human FP 억제 (0.1~0.5 추천)
+                    # lambda_dice   = 0.1   # GT에 human 있는 이미지에서 recall 올리기 (0.3~1.0 추천)
+                    # eps = 1e-6
+
+                    # # (B,) human 존재 여부
+                    # with torch.no_grad():
+                    #     has_human = (anno == HUMAN_ID).view(anno.size(0), -1).any(dim=1)
+
+                    # # softmax prob
+                    # prob = torch.softmax(output_seg, dim=1)            # (B,C,H,W)
+                    # p_h  = prob[:, HUMAN_ID]                           # (B,H,W)
+
+                    # # 1) Absent penalty: human 없는 이미지에서 human 확률 평균을 줄임 (FP 폭주 방지)
+                    # if (~has_human).any():
+                    #     p_abs = p_h[~has_human]                       # (Nabs,H,W)
+                    #     absent_penalty = torch.quantile(p_abs.reshape(p_abs.size(0), -1), 0.95, dim=1).mean()
+                    # else:
+                    #     absent_penalty = output_seg.new_tensor(0.0)
+
+                    # # 2) Human Dice: human 있는 이미지에서만 dice로 맞추게 함 (pred=0 방지)
+                    # g_h = (anno == HUMAN_ID).float()                   # (B,H,W)
+
+                    # if has_human.any():
+                    #     p = p_h[has_human].reshape(has_human.sum(), -1)
+                    #     g = g_h[has_human].reshape(has_human.sum(), -1)
+                    #     inter = (p * g).sum(dim=1)
+                    #     dice = (2.0 * inter + eps) / (p.sum(dim=1) + g.sum(dim=1) + eps)
+                    #     dice_loss = 1.0 - dice.mean()
+                    # else:
+                    #     dice_loss = output_seg.new_tensor(0.0)
+
+                    # # 최종 loss 합치기
+                    # loss = ce_loss + pfim_loss + pgdp_loss \
+                    #     + lambda_absent * absent_penalty \
+                    #     + lambda_dice   * dice_loss
+
+
+
+                # dbg
+                with torch.no_grad():
+                    pred = output_seg.argmax(dim=1)  # (B,H,W)
+                    gt = anno                          # (B,H,W)
+
+                    gt_h = (gt == 2).sum().item()
+                    pr_h = (pred == 2).sum().item()
+
+                    gt_v = (gt == 1).sum().item()
+                    pr_v = (pred == 1).sum().item()
+
+                    ratio_v = pr_v / (gt_v+1)
+                    ratio_h = pr_h / (gt_h+1)
+
+                    inter_h = ((pred == 2) & (anno == 2)).sum().item()
+
+                    if i % 50 == 0:
+                        print(f"[PIX] gt_v={gt_v} pred_v={pr_v} | gt_h={gt_h} pred_h={pr_h} | "
+                              f"ratio_v={ratio_v:.3f} ratio_h={ratio_h:.3f}")
+                        # print(f"CE={ce_loss.item():.4f} "
+                        # f"PFIM={(self.pfim_lambda * pfim_loss).item():.4f} "
+                        # f"PGDP={(self.pgdp_lambda * pgdp_loss).item():.4f}")
+                        # print(f"[HSTAT] gt={gt_h} pred={pr_h} inter={inter_h} "
+                        #     f"absent_pen={float(absent_penalty):.6f} dice_loss={float(dice_loss):.6f}")
+
+                    if i % 50 == 0:
+                        # weighted shares
+                        ce_w = ce_loss.item()
+                        pfim_w = self.pfim_lambda * pfim_loss.item()
+                        pgdp_w = self.pgdp_lambda * pgdp_loss.item()
+                        # dice_w = self.dice_lambda * dice_loss.item()
+
+                        # tot = ce_w + pfim_w + pgdp_w + dice_w + 1e-12
+                        tot = ce_w + pfim_w + pgdp_w + 1e-12
+
+                        dpf = getattr(self.model.pfim, "diag", None)
+                        dpg = getattr(self.model.pgdp, "diag", None)
+
+                        # print(f"[LOSS] ce={ce_w:.4f} pfim_w={pfim_w:.4f} pgdp_w={pgdp_w:.4f} dice_w={dice_w:.4f} | "
+                        #     f"pfim_share={pfim_w/tot:.2%} pgdp_share={pgdp_w/tot:.2%} dice_share={dice_w/tot:.2%}")
+
+                        print(f"[LOSS] ce={ce_w:.4f} pfim_w={pfim_w:.4f} pgdp_w={pgdp_w:.4f} | "
+                            f"pfim_share={pfim_w/tot:.2%} pgdp_share={pgdp_w/tot:.2%}")
+
+                        if dpf is not None:
+                            print(f"[PFIM] info(m,p95,min)={dpf['info_mean']:.3f},{dpf['info_p95']:.3f},{dpf['info_min']:.3f} | "
+                                f"gain(m,p95)={dpf['gain_mean']:.3f},{dpf['gain_p95']:.3f} | "
+                                f"z={dpf['z_abs_mean']:.2f} p(m)={dpf['p_mean']:.3f} clamp={dpf['p_clamp_ratio']:.2%} | "
+                                f"mae_mu_x={dpf['mae_mu_x']:.3f}")
+
+                        if dpg is not None:
+                            print(f"[PGDP] fg(m,p95)={dpg['p0_fg_mean']:.3f},{dpg['p0_fg_p95']:.3f} | "
+                                f"fg(min,max)={dpg['p0_fg_min']:.3f},{dpg['p0_fg_max']:.3f}")
+                            
+                # ===== accumulate PP diagnostics per batch (epoch average) =====
+                with torch.no_grad():
+                    dpf = getattr(self.model.pfim, "diag", None)  # PFIM diag dict (if exists)
+                    dpg = getattr(self.model.pgdp, "diag", None)  # PGDP diag dict (if exists)
+
+                    diag_sum["pfim_loss"] += _sf(pfim_loss)
+                    diag_sum["pgdp_total"] += _sf(pgdp_loss)
+
+                    # extras 기반(없으면 0)
+                    diag_sum["delta_ratio"] += _sf(extras.get("delta_ratio", 0.0))
+                    diag_sum["y1_ratio"]    += _sf(extras.get("y1_ratio", 0.0))
+                    diag_sum["y2_ratio"]    += _sf(extras.get("y2_ratio", 0.0))
+
+                    # PIX ratio (너가 이미 계산한 값)
+                    diag_sum["pix_ratio_h"] += _sf(ratio_h)
+                    diag_sum["pix_ratio_v"] += _sf(ratio_v)
+
+                    if dpf is not None:
+                        info_mean = _sf(dpf.get("info_mean", 0.0))
+                        info_std  = _sf(dpf.get("info_std", 0.0))
+                        info_p95  = _sf(dpf.get("info_p95", 0.0))
+                        gain_mean = _sf(dpf.get("gain_mean", 0.0))
+                        gain_p95  = _sf(dpf.get("gain_p95", 0.0))
+                        p_mean    = _sf(dpf.get("p_mean", 0.0))
+                        clamp_r   = _sf(dpf.get("p_clamp_ratio", 0.0))
+                        mae_mu_x  = _sf(dpf.get("mae_mu_x", 0.0))
+
+                        diag_sum["info_mean"] += info_mean
+                        diag_sum["info_std"]  += info_std
+                        diag_sum["info_p95"]  += info_p95
+                        diag_sum["pfim_gain_mean"] += gain_mean
+                        diag_sum["pfim_gain_p95"]  += gain_p95
+                        diag_sum["pfim_p_mean"]    += p_mean
+                        diag_sum["pfim_clamp_ratio"] += clamp_r
+                        diag_sum["pfim_mae_mu_x"]  += mae_mu_x
+
+                        diag_max["info_p95_max"] = max(diag_max["info_p95_max"], info_p95)
+                        diag_max["pfim_gain_p95_max"] = max(diag_max["pfim_gain_p95_max"], gain_p95)
+
+                    if dpg is not None:
+                        p0_mean = _sf(dpg.get("p0_fg_mean", 0.0))
+                        p0_p95  = _sf(dpg.get("p0_fg_p95", 0.0))
+                        p0_min  = _sf(dpg.get("p0_fg_min", 0.0))
+                        p0_max  = _sf(dpg.get("p0_fg_max", 0.0))
+
+                        diag_sum["p0_mean"] += p0_mean
+                        diag_sum["p0_p95"]  += p0_p95
+                        diag_sum["pgdp_p0_fg_min"] += p0_min
+                        diag_sum["pgdp_p0_fg_max"] += p0_max
+
+                        diag_max["p0_p95_max"] = max(diag_max["p0_p95_max"], p0_p95)
+                        diag_max["pgdp_p0_fg_max"] = max(diag_max["pgdp_p0_fg_max"], p0_max)
+
+                    diag_cnt += 1
 
                 train_loss += loss.item()
                 # loss.backward()
@@ -163,6 +415,25 @@ class Trainer(object):
             print(f'Average Training Loss for Epoch: {train_epoch_loss:.4f}')
 
             valid_epoch_loss, valid_epoch_IoU = self.validate_clft(valid_dataloader, modality)
+
+
+            # ===== finalize epoch diagnostics (avg + max) =====
+            if diag_cnt > 0:
+                diag_avg = {k: (diag_sum[k] / diag_cnt) for k in diag_sum.keys()}
+            else:
+                diag_avg = {k: 0.0 for k in diag_sum.keys()}
+
+            # max 컬럼 채우기
+            diag_avg["info_p95_max"] = diag_max["info_p95_max"]
+            diag_avg["pfim_gain_p95_max"] = diag_max["pfim_gain_p95_max"]
+            diag_avg["p0_p95_max"] = diag_max["p0_p95_max"]
+            diag_avg["pgdp_p0_fg_max"] = diag_max["pgdp_p0_fg_max"]
+
+            # CSV append: header 순서대로 저장
+            with open(self.log_path, "a", newline="") as f:
+                csv_writer = csv.writer(f)
+                csv_writer.writerow([epoch] + [diag_avg[k] for k in self.pp_csv_header if k != "epoch"])
+
 
 
             # Plot the train and validation loss in Tensorboard
@@ -206,7 +477,7 @@ class Trainer(object):
                 batch['anno'] = batch['anno'].to(self.device, non_blocking=True)
 
                 with autocast(enabled=self.use_amp, device_type="cuda"):
-                    _, output_seg = self.model(batch['rgb'], batch['lidar'], modal)
+                    _, output_seg, extras = self.model(batch['rgb'], batch['lidar'], modal)
 
                 # 1xHxW -> HxW
                 # output_seg = output_seg.squeeze(1)
@@ -224,7 +495,34 @@ class Trainer(object):
                 union_cum += batch_union
 
                 with autocast(enabled=self.use_amp, device_type="cuda"):
-                    loss = self.criterion(output_seg, anno)
+                    ce_loss = self.criterion(output_seg, anno)
+
+                    # human-only Dice
+                    # dice_loss = dice_loss_softmax(
+                    #     logits=output_seg,
+                    #     target=anno,
+                    #     class_id=self.human_class_id,
+                    #     ignore_index=4,
+                    # )
+
+                    # dice_applied = self.dice_lambda * dice_loss
+
+                    # PFIM loss (scalar)
+                    pfim_loss = extras["pfim_loss"]
+
+                    # PGDP GT & loss
+                    gt = self.pgdp_gt_builder(anno)              # {"M_gt","weights","valid"}
+                    pgdp_loss, pgdp_logs = self.pgdp_loss_fn(
+                        extras["p2"], extras["p1"], extras["p0"], gt
+                    )                                           # returns (total, logs)
+
+                    pfim_applied = self.pfim_lambda * pfim_loss
+                    pgdp_applied = self.pgdp_lambda * pgdp_loss
+
+                    # total
+                    # loss = ce_loss + dice_applied + pfim_applied + pgdp_applied
+
+                    loss = ce_loss + pfim_applied + pgdp_applied
 
                 valid_loss += loss.item()
                 progress_bar.set_description(f'valid fusion loss: {loss:.4f}')

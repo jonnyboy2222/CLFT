@@ -9,6 +9,10 @@ from clft.reassemble import Reassemble
 from clft.fusion import Fusion
 from clft.head import HeadDepth, HeadSeg
 
+from clft.clft_pgdp import PGDP
+from clft.clft_pfim import PFIM
+from clft.clft_cbam import CBAM
+
 torch.manual_seed(0)
 
 
@@ -67,6 +71,18 @@ class CLFT(nn.Module):
         self.reassembles_XYZ = nn.ModuleList(self.reassembles_XYZ)
         self.fusions = nn.ModuleList(self.fusions)
 
+        # P&P module
+        self.pfim = PFIM(
+            in_channels=resample_dim,
+            hidden_channels=resample_dim // 2
+        )
+        self.pgdp = PGDP(
+            feat_channels=resample_dim,
+            out_channels=2
+        )
+        self.cbam1 = CBAM(resample_dim)
+        self.cbam2 = CBAM(resample_dim)
+
         #Head
         if type == "full":
             self.head_depth = HeadDepth(resample_dim)
@@ -84,6 +100,7 @@ class CLFT(nn.Module):
         self.activation.clear()
         self.activation_rgb.clear()
         self.activation_xyz.clear()
+        extras = {}
 
         if modal == 'cross_fusion':
             self._hook_target = "rgb"
@@ -129,6 +146,73 @@ class CLFT(nn.Module):
             fusion_result = self.fusions[i](reassemble_result_RGB, reassemble_result_XYZ, previous_stage, modal)
             previous_stage = fusion_result
 
+            # i마다 stage fusion feature 보존
+            if i == 2:
+                stage2_feat = fusion_result
+            elif i == 1:
+                stage1_feat = fusion_result
+            elif i == 0:
+                stage0_feat = fusion_result
+
+        
+        # pfim 실행
+        y1, pfim_loss, info_map = self.pfim(stage0_feat)
+
+        # pgdp 실행
+        p2, p1, p0, y2 = self.pgdp(
+            stage2_feat,
+            stage1_feat,
+            stage0_feat,
+            info_map
+        )
+
+        # 증폭분만 활용
+        pfim_delta = y1 - stage0_feat
+        pgdp_delta = y2 - stage0_feat
+        
+        a1 = self.cbam1(pfim_delta)
+        a2 = self.cbam2(pgdp_delta)
+
+
+        updated_s0 = stage0_feat + a1 + a2
+        previous_stage = updated_s0
+
+        # ===== P&P Diagnostics =====
+        with torch.no_grad():
+            eps = 1e-6
+
+            # info map stats
+            info_mean = info_map.mean()
+            info_std  = info_map.std()
+            info_p95  = torch.quantile(info_map.flatten(), 0.95)
+
+            # PGDP foreground prior
+            p0_fg = p0.max(dim=1, keepdim=True).values
+            p0_mean = p0_fg.mean()
+            p0_p95  = torch.quantile(p0_fg.flatten(), 0.95)
+
+            # CBAM update strength
+            delta_s0 = updated_s0 - stage0_feat
+            delta_ratio = delta_s0.norm() / (stage0_feat.norm() + eps)
+
+            y1_ratio = y1.norm() / (updated_s0.norm() + eps)
+            y2_ratio = y2.norm() / (updated_s0.norm() + eps)
+
+        extras = {
+            "pfim_loss": pfim_loss,
+            "p2": p2, 
+            "p1": p1, 
+            "p0": p0,
+            "info_mean": info_mean.detach(),
+            "info_std": info_std.detach(),
+            "info_p95": info_p95.detach(),
+            "p0_mean": p0_mean.detach(),
+            "p0_p95": p0_p95.detach(),
+            "delta_ratio": delta_ratio.detach(),
+            "y1_ratio": y1_ratio.detach(),
+            "y2_ratio": y2_ratio.detach(),
+        }
+
         out_depth = None
         out_segmentation = None
         if self.head_depth is not None:
@@ -136,7 +220,7 @@ class CLFT(nn.Module):
         if self.head_segmentation is not None:
             out_segmentation = self.head_segmentation(previous_stage)
 
-        return out_depth, out_segmentation, # extras
+        return out_depth, out_segmentation, extras
 
     def _get_layers_from_hooks(self, hooks):
         def get_activation(name):
