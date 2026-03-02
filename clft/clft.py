@@ -164,6 +164,24 @@ class CLFT(nn.Module):
             info_map_xyz
         )
         
+        # w/ delta
+        # delta_rgb1 = y1_rgb - raw_stage0_rgb
+        # delta_rgb2 = y2_rgb - raw_stage0_rgb
+
+        # delta_xyz1 = y1_xyz - raw_stage0_xyz
+        # delta_xyz2 = y2_xyz - raw_stage0_xyz
+
+        # a1_rgb = self.cbam1_rgb(delta_rgb1)
+        # a2_rgb = self.cbam2_rgb(delta_rgb2)
+
+        # a1_xyz = self.cbam1_xyz(delta_xyz1)
+        # a2_xyz = self.cbam2_xyz(delta_xyz2)
+
+        # updated_s0_rgb = raw_stage0_rgb + a1_rgb + a2_rgb
+        # updated_s0_xyz = raw_stage0_xyz + a1_xyz + a2_xyz
+
+
+        # w/o delta
         a1_rgb = self.cbam1_rgb(y1_rgb)
         a2_rgb = self.cbam2_rgb(y2_rgb)
 
