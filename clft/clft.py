@@ -80,8 +80,14 @@ class CLFT(nn.Module):
             feat_channels=resample_dim,
             out_channels=2
         )
-        self.cbam1 = CBAM(resample_dim)
-        self.cbam2 = CBAM(resample_dim)
+        self.cbam1_rgb = CBAM(resample_dim)
+        self.cbam2_rgb = CBAM(resample_dim)
+
+        self.cbam1_xyz = CBAM(resample_dim)
+        self.cbam2_xyz = CBAM(resample_dim)
+
+        self.rgb_reassemble = {}
+        self.xyz_reassemble = {}
 
         #Head
         if type == "full":
@@ -100,7 +106,8 @@ class CLFT(nn.Module):
         self.activation.clear()
         self.activation_rgb.clear()
         self.activation_xyz.clear()
-        extras = {}
+        extras_rgb = {}
+        extras_xyz = {}
 
         if modal == 'cross_fusion':
             self._hook_target = "rgb"
@@ -118,99 +125,119 @@ class CLFT(nn.Module):
             _ = self.transformer_encoders(lidar)
         else:
             raise ValueError(f"Unknown modal='{modal}'. Expected 'rgb', 'lidar', or 'cross_fusion'.")
+        
+        # modal은 cross fusion 기본
+        for i in range(4):
+            hook_to_take = 't' + str(self.hooks[i])
 
+            # 각 모달리티 patch embedding
+            activation_result_rgb = self.activation_rgb[hook_to_take]
+            activation_result_xyz = self.activation_xyz[hook_to_take]
+
+            reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
+            reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz)
+
+            self.rgb_reassemble[i] = reassemble_result_RGB
+            self.xyz_reassemble[i] = reassemble_result_XYZ
+
+            if i == 0:
+                raw_stage0_rgb = reassemble_result_RGB
+                raw_stage0_xyz = reassemble_result_XYZ
+
+
+        # pfim 실행
+        y1_rgb, pfim_loss_rgb, info_map_rgb = self.pfim(self.rgb_reassemble[0])
+        y1_xyz, pfim_loss_xyz, info_map_xyz = self.pfim(self.xyz_reassemble[0])
+
+        # pgdp 실행
+        p2_rgb, p1_rgb, p0_rgb, y2_rgb = self.pgdp(
+            self.rgb_reassemble[2],
+            self.rgb_reassemble[1],
+            self.rgb_reassemble[0],
+            info_map_rgb
+        )
+
+        p2_xyz, p1_xyz, p0_xyz, y2_xyz = self.pgdp(
+            self.xyz_reassemble[2],
+            self.xyz_reassemble[1],
+            self.xyz_reassemble[0],
+            info_map_xyz
+        )
+        
+        a1_rgb = self.cbam1_rgb(y1_rgb)
+        a2_rgb = self.cbam2_rgb(y2_rgb)
+
+        a1_xyz = self.cbam1_xyz(y1_xyz)
+        a2_xyz = self.cbam2_xyz(y2_xyz)
+
+        updated_s0_rgb = a1_rgb + a2_rgb
+        updated_s0_xyz = a1_xyz + a2_xyz
+
+        self.rgb_reassemble[0] = updated_s0_rgb
+        self.xyz_reassemble[0] = updated_s0_xyz
 
         previous_stage = None
 
         for i in np.arange(len(self.fusions) - 1, -1, -1):
-            hook_to_take = 't' + str(self.hooks[i])
-
-            if modal == 'cross_fusion':
-                # 각 모달리티 patch embedding
-                activation_result_rgb = self.activation_rgb[hook_to_take]
-                activation_result_xyz = self.activation_xyz[hook_to_take]
-
-                reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
-                reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz)
-
-            elif modal == 'rgb':
-                activation_result = self.activation[hook_to_take]
-                reassemble_result_RGB = self.reassembles_RGB[i](activation_result)
-                reassemble_result_XYZ = torch.zeros_like(reassemble_result_RGB)
-
-            elif modal == 'lidar':
-                activation_result = self.activation[hook_to_take]
-                reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result)
-                reassemble_result_RGB = torch.zeros_like(reassemble_result_XYZ)
-
-            fusion_result = self.fusions[i](reassemble_result_RGB, reassemble_result_XYZ, previous_stage, modal)
+            fusion_result = self.fusions[i](self.rgb_reassemble[i], self.xyz_reassemble[i], previous_stage, modal)
             previous_stage = fusion_result
-
-            # i마다 stage fusion feature 보존
-            if i == 2:
-                stage2_feat = fusion_result
-            elif i == 1:
-                stage1_feat = fusion_result
-            elif i == 0:
-                stage0_feat = fusion_result
-
-        
-        # pfim 실행
-        y1, pfim_loss, info_map = self.pfim(stage0_feat)
-
-        # pgdp 실행
-        p2, p1, p0, y2 = self.pgdp(
-            stage2_feat,
-            stage1_feat,
-            stage0_feat,
-            info_map
-        )
-
-        # 증폭분만 활용
-        pfim_delta = y1 - stage0_feat
-        pgdp_delta = y2 - stage0_feat
-        
-        a1 = self.cbam1(pfim_delta)
-        a2 = self.cbam2(pgdp_delta)
-
-
-        updated_s0 = stage0_feat + a1 + a2
-        previous_stage = updated_s0
+            
 
         # ===== P&P Diagnostics =====
         with torch.no_grad():
             eps = 1e-6
 
+            # rgb
             # info map stats
-            info_mean = info_map.mean()
-            info_std  = info_map.std()
-            info_p95  = torch.quantile(info_map.flatten(), 0.95)
+            info_mean_rgb = info_map_rgb.mean()
+            info_p95_rgb  = torch.quantile(info_map_rgb.flatten(), 0.95)
 
             # PGDP foreground prior
-            p0_fg = p0.max(dim=1, keepdim=True).values
-            p0_mean = p0_fg.mean()
-            p0_p95  = torch.quantile(p0_fg.flatten(), 0.95)
+            p0_fg_rgb = p0_rgb.max(dim=1, keepdim=True).values
+            p0_mean_rgb = p0_fg_rgb.mean()
+            p0_p95_rgb  = torch.quantile(p0_fg_rgb.flatten(), 0.95)
 
             # CBAM update strength
-            delta_s0 = updated_s0 - stage0_feat
-            delta_ratio = delta_s0.norm() / (stage0_feat.norm() + eps)
+            delta_s0_rgb = updated_s0_rgb - raw_stage0_rgb
+            delta_ratio_rgb = delta_s0_rgb.norm() / (raw_stage0_rgb.norm() + eps)
 
-            y1_ratio = y1.norm() / (updated_s0.norm() + eps)
-            y2_ratio = y2.norm() / (updated_s0.norm() + eps)
 
-        extras = {
-            "pfim_loss": pfim_loss,
-            "p2": p2, 
-            "p1": p1, 
-            "p0": p0,
-            "info_mean": info_mean.detach(),
-            "info_std": info_std.detach(),
-            "info_p95": info_p95.detach(),
-            "p0_mean": p0_mean.detach(),
-            "p0_p95": p0_p95.detach(),
-            "delta_ratio": delta_ratio.detach(),
-            "y1_ratio": y1_ratio.detach(),
-            "y2_ratio": y2_ratio.detach(),
+            # xyz
+            # info map stats
+            info_mean_xyz = info_map_xyz.mean()
+            info_p95_xyz  = torch.quantile(info_map_xyz.flatten(), 0.95)
+
+            # PGDP foreground prior
+            p0_fg_xyz = p0_xyz.max(dim=1, keepdim=True).values
+            p0_mean_xyz = p0_fg_xyz.mean()
+            p0_p95_xyz  = torch.quantile(p0_fg_xyz.flatten(), 0.95)
+
+            # CBAM update strength
+            delta_s0_xyz = updated_s0_xyz - raw_stage0_xyz
+            delta_ratio_xyz = delta_s0_xyz.norm() / (raw_stage0_xyz.norm() + eps)
+
+        extras_rgb = {
+            "pfim_loss_rgb": pfim_loss_rgb,
+            "p2_rgb": p2_rgb, 
+            "p1_rgb": p1_rgb, 
+            "p0_rgb": p0_rgb,
+            "info_mean_rgb": info_mean_rgb.detach(),
+            "info_p95_rgb": info_p95_rgb.detach(),
+            "p0_mean_rgb": p0_mean_rgb.detach(),
+            "p0_p95_rgb": p0_p95_rgb.detach(),
+            "delta_ratio_rgb": delta_ratio_rgb.detach(),
+        }
+
+        extras_xyz = {
+            "pfim_loss_xyz": pfim_loss_xyz,
+            "p2_xyz": p2_xyz, 
+            "p1_xyz": p1_xyz, 
+            "p0_xyz": p0_xyz,
+            "info_mean_xyz": info_mean_xyz.detach(),
+            "info_p95_xyz": info_p95_xyz.detach(),
+            "p0_mean_xyz": p0_mean_xyz.detach(),
+            "p0_p95_xyz": p0_p95_xyz.detach(),
+            "delta_ratio_xyz": delta_ratio_xyz.detach(),
         }
 
         out_depth = None
@@ -220,7 +247,7 @@ class CLFT(nn.Module):
         if self.head_segmentation is not None:
             out_segmentation = self.head_segmentation(previous_stage)
 
-        return out_depth, out_segmentation, extras
+        return out_depth, out_segmentation, extras_rgb, extras_xyz
 
     def _get_layers_from_hooks(self, hooks):
         def get_activation(name):

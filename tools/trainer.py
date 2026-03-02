@@ -65,23 +65,12 @@ class Trainer(object):
             "pfim_loss",
             "pgdp_total",
             "info_mean",
-            "info_std",
             "info_p95",
             "info_p95_max",
-            "pfim_gain_mean",
-            "pfim_gain_p95",
-            "pfim_gain_p95_max",
-            "pfim_p_mean",
-            "pfim_clamp_ratio",
-            "pfim_mae_mu_x",
             "p0_mean",
             "p0_p95",
             "p0_p95_max",
-            "pgdp_p0_fg_min",
-            "pgdp_p0_fg_max",
             "delta_ratio",
-            "y1_ratio",
-            "y2_ratio",
             "pix_ratio_h",
             "pix_ratio_v",
         ]
@@ -176,9 +165,7 @@ class Trainer(object):
             # epoch 내 runaway/포화를 놓치지 않기 위한 max tracker
             diag_max = {
                 "info_p95_max": 0.0,
-                "pfim_gain_p95_max": 0.0,
                 "p0_p95_max": 0.0,
-                "pgdp_p0_fg_max": 0.0,
             }
 
             def _sf(x, default=0.0):
@@ -200,7 +187,7 @@ class Trainer(object):
                 self.optimizer_clft.zero_grad(set_to_none=True)
 
                 with autocast(enabled=self.use_amp, device_type="cuda"):
-                    _, output_seg, extras = self.model(batch['rgb'], batch['lidar'], modality)
+                    _, output_seg, extras_rgb, extras_xyz = self.model(batch['rgb'], batch['lidar'], modality)
 
                 # 1xHxW -> HxW
                 # output_seg = output_seg.squeeze(1)
@@ -230,17 +217,29 @@ class Trainer(object):
 
                     # dice_applied = self.dice_lambda * dice_loss
 
+                    # rgb
                     # PFIM loss (scalar)
-                    pfim_loss = extras["pfim_loss"]
+                    pfim_loss_rgb = extras_rgb["pfim_loss_rgb"]
 
                     # PGDP GT & loss
                     gt = self.pgdp_gt_builder(anno)              # {"M_gt","weights","valid"}
-                    pgdp_loss, pgdp_logs = self.pgdp_loss_fn(
-                        extras["p2"], extras["p1"], extras["p0"], gt
+
+                    pgdp_loss_rgb, pgdp_logs_rgb = self.pgdp_loss_fn(
+                        extras_rgb["p2_rgb"], extras_rgb["p1_rgb"], extras_rgb["p0_rgb"], gt
                     )                                           # returns (total, logs)
 
-                    pfim_applied = self.pfim_lambda * pfim_loss
-                    pgdp_applied = self.pgdp_lambda * pgdp_loss
+                    # xyz
+                    # PFIM loss (scalar)
+                    pfim_loss_xyz = extras_xyz["pfim_loss_xyz"]
+
+                    # PGDP GT & loss
+                    pgdp_loss_xyz, pgdp_logs_xyz = self.pgdp_loss_fn(
+                        extras_xyz["p2_xyz"], extras_xyz["p1_xyz"], extras_xyz["p0_xyz"], gt
+                    )                                           # returns (total, logs)
+
+                    pfim_applied = self.pfim_lambda * (0.5 * (pfim_loss_rgb + pfim_loss_xyz))
+                    pgdp_applied = self.pgdp_lambda * (0.5 * (pgdp_loss_rgb + pgdp_loss_xyz))
+
 
 
                     # total
@@ -315,86 +314,87 @@ class Trainer(object):
                         #     f"absent_pen={float(absent_penalty):.6f} dice_loss={float(dice_loss):.6f}")
 
                     if i % 50 == 0:
-                        # weighted shares
-                        ce_w = ce_loss.item()
-                        pfim_w = self.pfim_lambda * pfim_loss.item()
-                        pgdp_w = self.pgdp_lambda * pgdp_loss.item()
-                        # dice_w = self.dice_lambda * dice_loss.item()
+                        # weighted shares (모달 평균으로 스케일 맞춤)
+                        ce_w = float(ce_loss.detach().item())
 
-                        # tot = ce_w + pfim_w + pgdp_w + dice_w + 1e-12
+                        pfim_w = float(self.pfim_lambda * 0.5 * (
+                            extras_rgb["pfim_loss_rgb"].detach().item() +
+                            extras_xyz["pfim_loss_xyz"].detach().item()
+                        ))
+
+                        pgdp_w = float(self.pgdp_lambda * 0.5 * (
+                            pgdp_loss_rgb.detach().item() +
+                            pgdp_loss_xyz.detach().item()
+                        ))
+
                         tot = ce_w + pfim_w + pgdp_w + 1e-12
 
-                        dpf = getattr(self.model.pfim, "diag", None)
-                        dpg = getattr(self.model.pgdp, "diag", None)
+                        # ---- RGB/XYZ scalar logs from extras ----
+                        info_m_rgb = float(extras_rgb.get("info_mean_rgb", 0.0))
+                        info_p95_rgb = float(extras_rgb.get("info_p95_rgb", 0.0))
+                        p0_m_rgb = float(extras_rgb.get("p0_mean_rgb", 0.0))
+                        p0_p95_rgb = float(extras_rgb.get("p0_p95_rgb", 0.0))
+                        dr_rgb = float(extras_rgb.get("delta_ratio_rgb", 0.0))
 
-                        # print(f"[LOSS] ce={ce_w:.4f} pfim_w={pfim_w:.4f} pgdp_w={pgdp_w:.4f} dice_w={dice_w:.4f} | "
-                        #     f"pfim_share={pfim_w/tot:.2%} pgdp_share={pgdp_w/tot:.2%} dice_share={dice_w/tot:.2%}")
+                        info_m_xyz = float(extras_xyz.get("info_mean_xyz", 0.0))
+                        info_p95_xyz = float(extras_xyz.get("info_p95_xyz", 0.0))
+                        p0_m_xyz = float(extras_xyz.get("p0_mean_xyz", 0.0))
+                        p0_p95_xyz = float(extras_xyz.get("p0_p95_xyz", 0.0))
+                        dr_xyz = float(extras_xyz.get("delta_ratio_xyz", 0.0))
 
+                        # loss share
                         print(f"[LOSS] ce={ce_w:.4f} pfim_w={pfim_w:.4f} pgdp_w={pgdp_w:.4f} | "
                             f"pfim_share={pfim_w/tot:.2%} pgdp_share={pgdp_w/tot:.2%}")
 
-                        if dpf is not None:
-                            print(f"[PFIM] info(m,p95,min)={dpf['info_mean']:.3f},{dpf['info_p95']:.3f},{dpf['info_min']:.3f} | "
-                                f"gain(m,p95)={dpf['gain_mean']:.3f},{dpf['gain_p95']:.3f} | "
-                                f"z={dpf['z_abs_mean']:.2f} p(m)={dpf['p_mean']:.3f} clamp={dpf['p_clamp_ratio']:.2%} | "
-                                f"mae_mu_x={dpf['mae_mu_x']:.3f}")
+                        # PFIM (rgb/xyz)
+                        print(f"[PFIM_RGB] loss={float(extras_rgb['pfim_loss_rgb'].detach().item()):.4f} | "
+                            f"info(m,p95)={info_m_rgb:.3f},{info_p95_rgb:.3f} | "
+                            f"delta_ratio={dr_rgb:.4f}")
 
-                        if dpg is not None:
-                            print(f"[PGDP] fg(m,p95)={dpg['p0_fg_mean']:.3f},{dpg['p0_fg_p95']:.3f} | "
-                                f"fg(min,max)={dpg['p0_fg_min']:.3f},{dpg['p0_fg_max']:.3f}")
+                        print(f"[PFIM_XYZ] loss={float(extras_xyz['pfim_loss_xyz'].detach().item()):.4f} | "
+                            f"info(m,p95)={info_m_xyz:.3f},{info_p95_xyz:.3f} | "
+                            f"delta_ratio={dr_xyz:.4f}")
+
+                        # PGDP (rgb/xyz) : p0 fg stats는 extras에 들어있음
+                        print(f"[PGDP_RGB] loss={float(pgdp_loss_rgb.detach().item()):.4f} | "
+                            f"p0_fg(m,p95)={p0_m_rgb:.3f},{p0_p95_rgb:.3f}")
+
+                        print(f"[PGDP_XYZ] loss={float(pgdp_loss_xyz.detach().item()):.4f} | "
+                            f"p0_fg(m,p95)={p0_m_xyz:.3f},{p0_p95_xyz:.3f}")
                             
                 # ===== accumulate PP diagnostics per batch (epoch average) =====
                 with torch.no_grad():
-                    dpf = getattr(self.model.pfim, "diag", None)  # PFIM diag dict (if exists)
-                    dpg = getattr(self.model.pgdp, "diag", None)  # PGDP diag dict (if exists)
+                    # 모달 평균
+                    pfim_loss_mean = 0.5 * (pfim_loss_rgb + pfim_loss_xyz)
+                    pgdp_loss_mean = 0.5 * (pgdp_loss_rgb + pgdp_loss_xyz)
 
-                    diag_sum["pfim_loss"] += _sf(pfim_loss)
-                    diag_sum["pgdp_total"] += _sf(pgdp_loss)
+                    info_mean = 0.5 * (extras_rgb.get("info_mean_rgb", 0.0) + extras_xyz.get("info_mean_xyz", 0.0))
+                    info_p95  = 0.5 * (extras_rgb.get("info_p95_rgb", 0.0)  + extras_xyz.get("info_p95_xyz", 0.0))
 
-                    # extras 기반(없으면 0)
-                    diag_sum["delta_ratio"] += _sf(extras.get("delta_ratio", 0.0))
-                    diag_sum["y1_ratio"]    += _sf(extras.get("y1_ratio", 0.0))
-                    diag_sum["y2_ratio"]    += _sf(extras.get("y2_ratio", 0.0))
+                    p0_mean = 0.5 * (extras_rgb.get("p0_mean_rgb", 0.0) + extras_xyz.get("p0_mean_xyz", 0.0))
+                    p0_p95  = 0.5 * (extras_rgb.get("p0_p95_rgb", 0.0)  + extras_xyz.get("p0_p95_xyz", 0.0))
 
-                    # PIX ratio (너가 이미 계산한 값)
+                    delta_ratio = 0.5 * (extras_rgb.get("delta_ratio_rgb", 0.0) + extras_xyz.get("delta_ratio_xyz", 0.0))
+
+                    # CSV에 맞는 필드만 채움 (없는 필드는 0 유지)
+                    diag_sum["pfim_loss"] += _sf(pfim_loss_mean)
+                    diag_sum["pgdp_total"] += _sf(pgdp_loss_mean)
+
+                    diag_sum["info_mean"] += _sf(info_mean)
+                    diag_sum["info_p95"]  += _sf(info_p95)
+
+                    diag_sum["p0_mean"] += _sf(p0_mean)
+                    diag_sum["p0_p95"]  += _sf(p0_p95)
+
+                    diag_sum["delta_ratio"] += _sf(delta_ratio)
+
+                    # PIX ratio
                     diag_sum["pix_ratio_h"] += _sf(ratio_h)
                     diag_sum["pix_ratio_v"] += _sf(ratio_v)
 
-                    if dpf is not None:
-                        info_mean = _sf(dpf.get("info_mean", 0.0))
-                        info_std  = _sf(dpf.get("info_std", 0.0))
-                        info_p95  = _sf(dpf.get("info_p95", 0.0))
-                        gain_mean = _sf(dpf.get("gain_mean", 0.0))
-                        gain_p95  = _sf(dpf.get("gain_p95", 0.0))
-                        p_mean    = _sf(dpf.get("p_mean", 0.0))
-                        clamp_r   = _sf(dpf.get("p_clamp_ratio", 0.0))
-                        mae_mu_x  = _sf(dpf.get("mae_mu_x", 0.0))
-
-                        diag_sum["info_mean"] += info_mean
-                        diag_sum["info_std"]  += info_std
-                        diag_sum["info_p95"]  += info_p95
-                        diag_sum["pfim_gain_mean"] += gain_mean
-                        diag_sum["pfim_gain_p95"]  += gain_p95
-                        diag_sum["pfim_p_mean"]    += p_mean
-                        diag_sum["pfim_clamp_ratio"] += clamp_r
-                        diag_sum["pfim_mae_mu_x"]  += mae_mu_x
-
-                        diag_max["info_p95_max"] = max(diag_max["info_p95_max"], info_p95)
-                        diag_max["pfim_gain_p95_max"] = max(diag_max["pfim_gain_p95_max"], gain_p95)
-
-                    if dpg is not None:
-                        p0_mean = _sf(dpg.get("p0_fg_mean", 0.0))
-                        p0_p95  = _sf(dpg.get("p0_fg_p95", 0.0))
-                        p0_min  = _sf(dpg.get("p0_fg_min", 0.0))
-                        p0_max  = _sf(dpg.get("p0_fg_max", 0.0))
-
-                        diag_sum["p0_mean"] += p0_mean
-                        diag_sum["p0_p95"]  += p0_p95
-                        diag_sum["pgdp_p0_fg_min"] += p0_min
-                        diag_sum["pgdp_p0_fg_max"] += p0_max
-
-                        diag_max["p0_p95_max"] = max(diag_max["p0_p95_max"], p0_p95)
-                        diag_max["pgdp_p0_fg_max"] = max(diag_max["pgdp_p0_fg_max"], p0_max)
+                    # max tracker도 평균 기준으로
+                    diag_max["info_p95_max"] = max(diag_max["info_p95_max"], _sf(info_p95))
+                    diag_max["p0_p95_max"]   = max(diag_max["p0_p95_max"], _sf(p0_p95))
 
                     diag_cnt += 1
 
@@ -425,9 +425,7 @@ class Trainer(object):
 
             # max 컬럼 채우기
             diag_avg["info_p95_max"] = diag_max["info_p95_max"]
-            diag_avg["pfim_gain_p95_max"] = diag_max["pfim_gain_p95_max"]
             diag_avg["p0_p95_max"] = diag_max["p0_p95_max"]
-            diag_avg["pgdp_p0_fg_max"] = diag_max["pgdp_p0_fg_max"]
 
             # CSV append: header 순서대로 저장
             with open(self.log_path, "a", newline="") as f:
@@ -477,7 +475,7 @@ class Trainer(object):
                 batch['anno'] = batch['anno'].to(self.device, non_blocking=True)
 
                 with autocast(enabled=self.use_amp, device_type="cuda"):
-                    _, output_seg, extras = self.model(batch['rgb'], batch['lidar'], modal)
+                    _, output_seg, extras_rgb, extras_xyz = self.model(batch['rgb'], batch['lidar'], modal)
 
                 # 1xHxW -> HxW
                 # output_seg = output_seg.squeeze(1)
@@ -507,17 +505,30 @@ class Trainer(object):
 
                     # dice_applied = self.dice_lambda * dice_loss
 
+                    # rgb
                     # PFIM loss (scalar)
-                    pfim_loss = extras["pfim_loss"]
+                    pfim_loss_rgb = extras_rgb["pfim_loss_rgb"]
 
                     # PGDP GT & loss
                     gt = self.pgdp_gt_builder(anno)              # {"M_gt","weights","valid"}
-                    pgdp_loss, pgdp_logs = self.pgdp_loss_fn(
-                        extras["p2"], extras["p1"], extras["p0"], gt
+
+                    pgdp_loss_rgb, pgdp_logs_rgb = self.pgdp_loss_fn(
+                        extras_rgb["p2_rgb"], extras_rgb["p1_rgb"], extras_rgb["p0_rgb"], gt
                     )                                           # returns (total, logs)
 
-                    pfim_applied = self.pfim_lambda * pfim_loss
-                    pgdp_applied = self.pgdp_lambda * pgdp_loss
+                    # xyz
+                    # PFIM loss (scalar)
+                    pfim_loss_xyz = extras_xyz["pfim_loss_xyz"]
+
+                    # PGDP GT & loss
+                    pgdp_loss_xyz, pgdp_logs_xyz = self.pgdp_loss_fn(
+                        extras_xyz["p2_xyz"], extras_xyz["p1_xyz"], extras_xyz["p0_xyz"], gt
+                    )                                           # returns (total, logs)
+
+                    pfim_applied = self.pfim_lambda * (0.5 * (pfim_loss_rgb + pfim_loss_xyz))
+                    pgdp_applied = self.pgdp_lambda * (0.5 * (pgdp_loss_rgb + pgdp_loss_xyz))
+
+
 
                     # total
                     # loss = ce_loss + dice_applied + pfim_applied + pgdp_applied
