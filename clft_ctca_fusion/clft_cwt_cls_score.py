@@ -5,12 +5,13 @@ import torch.nn.functional as F
 
 class CWT(nn.Module):
     """
-    Class-wise Tokenizer (CWT)
+    Class-wise Tokenizer based on cls score (CWT)
     Input   : (B, N, D)     ViT patch embedding(including class token itself)
     Output  : (B, K, D)     where K = num_classes
     """
-    def __init__(self, emb_dim=768, num_classes=3, hidden=256):
+    def __init__(self, emb_dim=768, num_classes=2, hidden=256, temp=1.0):
         super(CWT, self).__init__()
+        self.temp = float(temp)
 
         self.simple_mlp = nn.Sequential(
             nn.Linear(emb_dim, hidden),
@@ -25,6 +26,7 @@ class CWT(nn.Module):
         B, N, D = x_token.shape
 
         s = self.simple_mlp(x_token)          # (B, N, K) k: class score
+        s = s / max(self.temp, 1e-6)
         # a = F.softmax(s, dim=1)               # (B, N, K) k: class index
         # # relative class-wise prob of n^th token
 
@@ -55,10 +57,8 @@ class CWT(nn.Module):
 
             a = a.to(dtype=s.dtype)
 
-        a = F.softmax(s, dim=1)  # (B, Np, K)
-
         cls_token = torch.bmm(a.transpose(1, 2), x_token)  # (B, K, D)
-        return cls_token # , a
+        return cls_token, a.transpose(1, 2).contiguous()   # (B, K, Np) -> a
 
 
 # check

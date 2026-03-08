@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import timm
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
@@ -72,19 +73,19 @@ class CLFT(nn.Module):
         self.fusions = nn.ModuleList(self.fusions)
 
         # P&P module
-        self.pfim = PFIM(
-            in_channels=resample_dim,
-            hidden_channels=resample_dim // 2
-        )
+        # self.pfim = PFIM(
+        #     in_channels=resample_dim,
+        #     hidden_channels=resample_dim // 2
+        # )
         self.pgdp = PGDP(
             feat_channels=resample_dim,
             out_channels=2
         )
-        self.cbam1_rgb = CBAM(resample_dim)
-        self.cbam2_rgb = CBAM(resample_dim)
+        # self.cbam1_rgb = CBAM(resample_dim)
+        # self.cbam2_rgb = CBAM(resample_dim)
 
-        self.cbam1_xyz = CBAM(resample_dim)
-        self.cbam2_xyz = CBAM(resample_dim)
+        # self.cbam1_xyz = CBAM(resample_dim)
+        # self.cbam2_xyz = CBAM(resample_dim)
 
         self.rgb_reassemble = {}
         self.xyz_reassemble = {}
@@ -100,7 +101,7 @@ class CLFT(nn.Module):
             self.head_depth = None
             self.head_segmentation = HeadSeg(resample_dim, nclasses=nclasses)
 
-    def forward(self, rgb, lidar, modal='rgb'):
+    def forward(self, rgb, lidar, modal='rgb', anno=None):
         # key clear
         # forward할 때 이전 값이 남아있을 경우를 대비
         self.activation.clear()
@@ -141,30 +142,43 @@ class CLFT(nn.Module):
             self.xyz_reassemble[i] = reassemble_result_XYZ
 
             if i == 0:
-                raw_stage0_rgb = reassemble_result_RGB
-                raw_stage0_xyz = reassemble_result_XYZ
+                raw_stage0_rgb = reassemble_result_RGB.clone()
+                # raw_stage0_xyz = reassemble_result_XYZ
 
+        # PFIM gain gate (GT boundary-soft, training/analysis only)
+        # pfim_gain_gate = None
+        # if anno is not None:
+        #     pfim_gain_gate = self._build_pfim_gain_gate(
+        #         anno,
+        #         out_hw=self.rgb_reassemble[0].shape[-2:],
+        #         ignore_index=4,
+        #         fg_weight=0.25,
+        #         bd_weight=0.75,
+        #     )
 
         # pfim 실행
-        y1_rgb, pfim_loss_rgb, info_map_rgb = self.pfim(self.rgb_reassemble[0])
-        y1_xyz, pfim_loss_xyz, info_map_xyz = self.pfim(self.xyz_reassemble[0])
+        # y1_rgb, pfim_loss_rgb, info_map_rgb = self.pfim(self.rgb_reassemble[0])
+        # y1_xyz, pfim_loss_xyz, info_map_xyz = self.pfim(self.xyz_reassemble[0], gain_gate=pfim_gain_gate)
 
         # pgdp 실행
+        stage2_pgdp = self.rgb_reassemble[2].clone()
+        stage1_pgdp = self.rgb_reassemble[1].clone()
+        stage0_pgdp = self.rgb_reassemble[0].clone()
+
         p2_rgb, p1_rgb, p0_rgb, y2_rgb = self.pgdp(
-            self.rgb_reassemble[2],
-            self.rgb_reassemble[1],
-            self.rgb_reassemble[0],
-            info_map_rgb
+            stage2_pgdp,
+            stage1_pgdp,
+            stage0_pgdp,
         )
 
-        p2_xyz, p1_xyz, p0_xyz, y2_xyz = self.pgdp(
-            self.xyz_reassemble[2],
-            self.xyz_reassemble[1],
-            self.xyz_reassemble[0],
-            info_map_xyz
-        )
+        # p2_xyz, p1_xyz, p0_xyz, y2_xyz = self.pgdp(
+        #     self.xyz_reassemble[2],
+        #     self.xyz_reassemble[1],
+        #     self.xyz_reassemble[0],
+        #     info_map_xyz
+        # )
         
-        # w/ delta
+        '''w/ delta'''
         # delta_rgb1 = y1_rgb - raw_stage0_rgb
         # delta_rgb2 = y2_rgb - raw_stage0_rgb
 
@@ -177,22 +191,26 @@ class CLFT(nn.Module):
         # a1_xyz = self.cbam1_xyz(delta_xyz1)
         # a2_xyz = self.cbam2_xyz(delta_xyz2)
 
-        # updated_s0_rgb = raw_stage0_rgb + a1_rgb + a2_rgb
+
+        # updated_s0_rgb = y2_rgb
+        # updated_s0_rgb = raw_stage0_rgb + a2_rgb
         # updated_s0_xyz = raw_stage0_xyz + a1_xyz + a2_xyz
 
 
-        # w/o delta
-        a1_rgb = self.cbam1_rgb(y1_rgb)
-        a2_rgb = self.cbam2_rgb(y2_rgb)
+        '''w/o delta'''
+        # a1_rgb = self.cbam1_rgb(y1_rgb)
+        # a2_rgb = self.cbam2_rgb(y2_rgb)
 
-        a1_xyz = self.cbam1_xyz(y1_xyz)
-        a2_xyz = self.cbam2_xyz(y2_xyz)
+        # a1_xyz = self.cbam1_xyz(y1_xyz)
+        # a2_xyz = self.cbam2_xyz(y2_xyz)
 
-        updated_s0_rgb = a1_rgb + a2_rgb
-        updated_s0_xyz = a1_xyz + a2_xyz
+        # updated_s0_rgb = a1_rgb + a2_rgb
+        # updated_s0_xyz = a1_xyz + a2_xyz
 
-        self.rgb_reassemble[0] = updated_s0_rgb
-        self.xyz_reassemble[0] = updated_s0_xyz
+
+        '''update'''
+        self.rgb_reassemble[0] = y2_rgb
+        # self.xyz_reassemble[0] = updated_s0_xyz
 
         previous_stage = None
 
@@ -207,8 +225,8 @@ class CLFT(nn.Module):
 
             # rgb
             # info map stats
-            info_mean_rgb = info_map_rgb.mean()
-            info_p95_rgb  = torch.quantile(info_map_rgb.flatten(), 0.95)
+            # info_mean_rgb = info_map_rgb.mean()
+            # info_p95_rgb  = torch.quantile(info_map_rgb.flatten(), 0.95)
 
             # PGDP foreground prior
             p0_fg_rgb = p0_rgb.max(dim=1, keepdim=True).values
@@ -216,47 +234,47 @@ class CLFT(nn.Module):
             p0_p95_rgb  = torch.quantile(p0_fg_rgb.flatten(), 0.95)
 
             # CBAM update strength
-            delta_s0_rgb = updated_s0_rgb - raw_stage0_rgb
+            delta_s0_rgb = y2_rgb - raw_stage0_rgb
             delta_ratio_rgb = delta_s0_rgb.norm() / (raw_stage0_rgb.norm() + eps)
 
 
             # xyz
             # info map stats
-            info_mean_xyz = info_map_xyz.mean()
-            info_p95_xyz  = torch.quantile(info_map_xyz.flatten(), 0.95)
+            # info_mean_xyz = info_map_xyz.mean()
+            # info_p95_xyz  = torch.quantile(info_map_xyz.flatten(), 0.95)
 
             # PGDP foreground prior
-            p0_fg_xyz = p0_xyz.max(dim=1, keepdim=True).values
-            p0_mean_xyz = p0_fg_xyz.mean()
-            p0_p95_xyz  = torch.quantile(p0_fg_xyz.flatten(), 0.95)
+            # p0_fg_xyz = p0_xyz.max(dim=1, keepdim=True).values
+            # p0_mean_xyz = p0_fg_xyz.mean()
+            # p0_p95_xyz  = torch.quantile(p0_fg_xyz.flatten(), 0.95)
 
             # CBAM update strength
-            delta_s0_xyz = updated_s0_xyz - raw_stage0_xyz
-            delta_ratio_xyz = delta_s0_xyz.norm() / (raw_stage0_xyz.norm() + eps)
+            # delta_s0_xyz = updated_s0_xyz - raw_stage0_xyz
+            # delta_ratio_xyz = delta_s0_xyz.norm() / (raw_stage0_xyz.norm() + eps)
 
         extras_rgb = {
-            "pfim_loss_rgb": pfim_loss_rgb,
+            # "pfim_loss_rgb": pfim_loss_rgb,
             "p2_rgb": p2_rgb, 
             "p1_rgb": p1_rgb, 
             "p0_rgb": p0_rgb,
-            "info_mean_rgb": info_mean_rgb.detach(),
-            "info_p95_rgb": info_p95_rgb.detach(),
+            # "info_mean_rgb": info_mean_rgb.detach(),
+            # "info_p95_rgb": info_p95_rgb.detach(),
             "p0_mean_rgb": p0_mean_rgb.detach(),
             "p0_p95_rgb": p0_p95_rgb.detach(),
             "delta_ratio_rgb": delta_ratio_rgb.detach(),
         }
 
-        extras_xyz = {
-            "pfim_loss_xyz": pfim_loss_xyz,
-            "p2_xyz": p2_xyz, 
-            "p1_xyz": p1_xyz, 
-            "p0_xyz": p0_xyz,
-            "info_mean_xyz": info_mean_xyz.detach(),
-            "info_p95_xyz": info_p95_xyz.detach(),
-            "p0_mean_xyz": p0_mean_xyz.detach(),
-            "p0_p95_xyz": p0_p95_xyz.detach(),
-            "delta_ratio_xyz": delta_ratio_xyz.detach(),
-        }
+        # extras_xyz = {
+        #     "pfim_loss_xyz": pfim_loss_xyz,
+        #     "p2_xyz": p2_xyz, 
+        #     "p1_xyz": p1_xyz, 
+        #     "p0_xyz": p0_xyz,
+        #     "info_mean_xyz": info_mean_xyz.detach(),
+        #     "info_p95_xyz": info_p95_xyz.detach(),
+        #     "p0_mean_xyz": p0_mean_xyz.detach(),
+        #     "p0_p95_xyz": p0_p95_xyz.detach(),
+        #     "delta_ratio_xyz": delta_ratio_xyz.detach(),
+        # }
 
         out_depth = None
         out_segmentation = None
@@ -265,7 +283,37 @@ class CLFT(nn.Module):
         if self.head_segmentation is not None:
             out_segmentation = self.head_segmentation(previous_stage)
 
-        return out_depth, out_segmentation, extras_rgb, extras_xyz
+        return out_depth, out_segmentation, extras_rgb # , extras_xyz
+    
+    
+    # def _build_pfim_gain_gate(self, anno, out_hw, ignore_index=4,
+    #                           fg_weight=0.25, bd_weight=0.75):
+    #     """
+    #     anno: (B,H,W) or (B,1,H,W)
+    #     out_hw: (H_out, W_out)
+    #     return: (B,1,H_out,W_out) in [0,1]
+    #     """
+    #     if anno is None:
+    #         return None
+
+    #     if anno.ndim == 4 and anno.size(1) == 1:
+    #         anno = anno.squeeze(1)   # (B,H,W)
+
+    #     # foreground: car/human only, ignore 제외
+    #     fg = ((anno > 0) & (anno != ignore_index)).float().unsqueeze(1)   # (B,1,H,W)
+
+    #     # stage0 resolution으로 다운샘플
+    #     fg = F.interpolate(fg, size=out_hw, mode="nearest")
+
+    #     # soft boundary: avg가 0.5 부근일수록 큼
+    #     avg = F.avg_pool2d(fg, kernel_size=3, stride=1, padding=1)
+    #     boundary_soft = 4.0 * avg * (1.0 - avg)   # [0,1], 경계 부근에서 peak
+
+    #     # object interior도 약하게 살려두고, boundary를 더 강조
+    #     gate = fg_weight * fg + bd_weight * boundary_soft
+    #     gate = gate.clamp(0.0, 1.0)
+
+    #     return gate
 
     def _get_layers_from_hooks(self, hooks):
         def get_activation(name):

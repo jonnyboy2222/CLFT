@@ -114,9 +114,9 @@ def run(modality, backbone, config):
                           if torch.cuda.is_available() else "cpu")
     open_input = OpenInput(backbone,
                            cam_mean=config['Dataset']['transforms']['image_mean'],
-                           cam_std=config['Dataset']['transforms']['image_std'],
+                           cam_std=config['Dataset']['transforms']['image_mean'],
                            lidar_mean=config['Dataset']['transforms']['lidar_mean_waymo'],
-                           lidar_std=config['Dataset']['transforms']['lidar_std_waymo'],
+                           lidar_std=config['Dataset']['transforms']['lidar_mean_waymo'],
                            w_ratio=4,
                            h_ratio=4)
 
@@ -145,15 +145,6 @@ def run(modality, backbone, config):
             model_timm=config['CLFT']['model_timm'],
             )
         print(f'Using backbone {args.backbone}')
-
-        # swin용
-        # dummy forward로 conv1 실제 생성
-        model.to(device)
-        model.eval()
-        with torch.no_grad():
-            dummy_rgb = torch.zeros(1, 3, resize, resize, device=device)
-            dummy_lidar = torch.zeros(1, 3, resize, resize, device=device)
-            _ = model(dummy_rgb, dummy_lidar, modality)  # 여기서 reassemble.resample.conv1들이 다 만들어짐
 
         model_path = config['General']['model_path']
         model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
@@ -187,8 +178,7 @@ def run(modality, backbone, config):
 
         if backbone == 'clft':
             with torch.no_grad():
-                # 보조헤드 -> aux_human_logits 추가
-                _, output_seg, aux_human_logits = model(rgb, lidar, modality)
+                _, output_seg = model(rgb, lidar, modality)
                 segmented_image = draw_test_segmentation_map(output_seg)
                 seg_resize = cv2.resize(segmented_image, (480, 160))
 

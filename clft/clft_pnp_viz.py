@@ -32,7 +32,7 @@ from tools.clft_pgdp_gt import PGDPBuilderGT
 # USER CONFIG (ctca_only_heatmap.py랑 동일 스타일)
 # ==========================================================
 CONFIG_PATH = "/home/john/dev_ws/CLFT/config.json"
-CKPT_PATH   = "/home/john/dev_ws/CLFT/logs/clft_fusioncheckpoint_1.pth"
+CKPT_PATH   = "/home/john/dev_ws/CLFT/logs/clft_fusioncheckpoint_90.pth"
 DEMO_LIST   = "/home/john/dev_ws/CLFT/waymo_dataset/visual_run_demo.txt"
 
 SPLIT  = "val"
@@ -129,7 +129,7 @@ def main():
     model.load_state_dict(ckpt["model_state_dict"], strict=True)
     model.eval()
 
-    pgdp_gt_builder = PGDPBuilderGT()
+    pgdp_gt_builder = PGDPBuilderGT(refine=True)
 
     demo_lines = [ln.strip() for ln in Path(DEMO_LIST).read_text().splitlines() if ln.strip()]
 

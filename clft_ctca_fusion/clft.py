@@ -5,14 +5,15 @@ import timm
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
-from clft.reassemble import Reassemble
-from clft.fusion import Fusion
-from clft.head import HeadDepth, HeadSeg
+from clft_ctca_fusion.reassemble import Reassemble
+from clft_ctca_fusion.fusion import Fusion
+from clft_ctca_fusion.head import HeadDepth, HeadSeg
 
-from clft.clft_cwt import CWT
-from clft.clft_ctsa import CTSA
-from clft.clft_ctca import CTCA
-from clft.clft_mask import patch_mask_from_lidar, apply_token_mask_to_vit_emb
+from clft_ctca_fusion.clft_cwt_cls_score import CWT
+from clft_ctca_fusion.clft_ctsa import CTSA
+from clft_ctca_fusion.clft_ctca import CTCA
+from clft_ctca_fusion.clft_mask import patch_mask_from_lidar, apply_token_mask_to_vit_emb
+
 
 torch.manual_seed(0)
 
@@ -46,6 +47,7 @@ class CLFT(nn.Module):
 
         self.transformer_encoders = timm.create_model(model_timm, pretrained=True)
         self.type_ = type
+        self.patch_size = patch_size
 
         # cls token 관련 클래스 객체 생성
         self.cwt = CWT()
@@ -57,7 +59,7 @@ class CLFT(nn.Module):
         # 2D + 1 -> 3D + 1 (gate input에 cam추가)
         # self.gate_proj = nn.Linear(3 * emb_dim + 1, 1, bias=True)
 
-        # self.gate_proj = nn.Linear(2 * emb_dim + 1, 1, bias=True)
+        self.gate_proj = nn.Linear(2 * emb_dim + 1, 1, bias=True)
         
         # cam entropy용
         # L, CTCA, M, U_C
@@ -101,11 +103,13 @@ class CLFT(nn.Module):
 
         # ctca gate logging
         self.last_tokgate = {
-            "S2": {"g_mean": None, "g_std": None},
-            "S0": {"g_mean": None, "g_std": None},
+            "S2": {"g_mean": None, "g_std": None, "d_norm": None, "upd_norm": None},
+            "S0": {"g_mean": None, "g_std": None, "d_norm": None, "upd_norm": None},
         }
         self.last_tokgate_map = {"S2": None, "S0": None}  # (B,1,Hp,Wp)
         # self.alpha = 0.7
+
+        self.alpha = 0.1
 
         # cam entropy용
         # self.nclasses = nclasses
@@ -127,7 +131,7 @@ class CLFT(nn.Module):
         return ent
 
 
-    def forward(self, rgb, lidar, modal='rgb'):
+    def forward(self, rgb, lidar, modal='rgb', return_extras=False):
         # key clear
         # forward할 때 이전 값이 남아있을 경우를 대비
         self.activation.clear()
@@ -155,17 +159,21 @@ class CLFT(nn.Module):
         if modal == "cross_fusion":
             # lidar: (B,C,H,W) projected lidar image
             # patch_size는 __init__ 인자로 들어온 그 patch_size를 그대로 사용
-            mask_tok = patch_mask_from_lidar(lidar, patch_size=16, eps=0.0, dtype=torch.float32)  # (B,N,1)
+            mask_tok = patch_mask_from_lidar(lidar, patch_size=self.patch_size, eps=0.0, dtype=torch.float32)  # (B,N,1)
 
         # mask token을 2d로 바꾸기 위해 grid 사이즈 구하기
         mask_2d = None
         Hp = Wp = None
         if mask_tok is not None:
             B, C, H, W = lidar.shape
-            P = 16  # 지금 patch_mask_from_lidar에서 patch_size=16으로 고정했으니 동일하게
+            P = self.patch_size
             Hp, Wp = H // P, W // P
             # (B,N,1) -> (B,1,Hp,Wp)
             mask_2d = mask_tok.view(B, Hp, Wp, 1).permute(0, 3, 1, 2).contiguous()  # float(0/1)
+
+        extras = {}
+        if modal == 'cross_fusion':
+            extras['HpWp'] = (Hp, Wp)
 
         previous_stage = None
 
@@ -180,107 +188,154 @@ class CLFT(nn.Module):
                 reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
                 reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz)
 
-                # if i == 2:
-                #     # cwt_cam2 = self.cwt(activation_result_rgb)
-                #     # cwt_xyz2 = self.cwt(activation_result_xyz)        # mask 미적용
-                #     # cls_token_stage2 = torch.cat([cwt_cam2, cwt_xyz2], dim=1)   # (B, 2K, D) 같은 형태
-                #     # ctsa_out2 = self.ctsa(cls_token_stage2)                     # (B, Nk, D)  Nk=2K
+                if i == 2:
+                    cwt_cam2, w_cam2 = self.cwt(activation_result_rgb)
+                    cwt_xyz2, w_xyz2 = self.cwt(activation_result_xyz)        # mask 미적용
 
-                #     # ----- CTCA + gated update (LiDAR token update) -----
-                #     cls_xyz2 = activation_result_xyz[:, :1, :]                  # (B,1,D)  CLS 고정
-                #     L2 = activation_result_xyz[:, 1:, :]                        # (B,N,D)
-                #     C2 = activation_result_rgb[:, 1:, :]
+                    # token slot 정규화용
+                    extras['tok_cam_s2'] = cwt_cam2
+                    extras['w_cam_s2']   = w_cam2
+                    extras['tok_xyz_s2'] = cwt_xyz2
+                    extras['w_xyz_s2']   = w_xyz2
 
-                #     # delta2 = self.ctca(L2, ctsa_out2)                           # (B,N,D)  Δ, mask 미적용
+                    cls_token_stage2 = torch.cat([cwt_cam2, cwt_xyz2], dim=1)   # (B, 2K, D) 같은 형태
+                    ctsa_out2 = self.ctsa(cls_token_stage2)                     # (B, Nk, D)  Nk=2K
 
-                #     # CTCA heatmap
-                #     # with torch.no_grad():
-                #     #     # delta: (B, N, D)
-                #     #     delta_norm2 = torch.norm(delta2, dim=-1)  # (B, N)
-                #     #     self.last_delta_norm2 = delta_norm2       # token space
-                #     #     self.last_delta_hw2   = (Hp, Wp)
+                    # ----- CTCA + gated update (LiDAR token update) -----
+                    cls_xyz2 = activation_result_xyz[:, :1, :]                  # (B,1,D)  CLS 고정
+                    L2 = activation_result_xyz[:, 1:, :]                        # (B,N,D)
+                    C2 = activation_result_rgb[:, 1:, :]
 
-                #     # g = sigmoid(Linear([L, Δ, M]))
-                #     if mask_tok is None:
-                #         raise RuntimeError("mask_tok is None in cross_fusion; check mask creation.")
+                    delta2 = self.ctca(L2, ctsa_out2)                           # (B,N,D)  Δ, mask 미적용
+
+                    # 클래스 토큰 concat (ctsa)제거 실험 (라이다 토큰으로만 클래스 토큰 생성)
+                    # delta2 = self.ctca(L2, cwt_xyz2)
+
+                    # CTCA heatmap
+                    # with torch.no_grad():
+                    #     # delta: (B, N, D)
+                    #     delta_norm2 = torch.norm(delta2, dim=-1)  # (B, N)
+                    #     self.last_delta_norm2 = delta_norm2       # token space
+                    #     self.last_delta_hw2   = (Hp, Wp)
+
+                    # g = sigmoid(Linear([L, Δ, M]))
+                    if mask_tok is None:
+                        raise RuntimeError("mask_tok is None in cross_fusion; check mask creation.")
                     
-                #     # cam uncertainty용
-                #     # logits2 = self.cam_aux_logits(C2)                 # (B,N,K)
-                #     # U_C2 = self._camera_uncertainty(logits2).detach()
-                #     # gate_in2 = torch.cat([L2, delta2, mask_tok, U_C2], dim=-1)    # (B,N,2D+1) -> 3D + 1
+                    # cam uncertainty용
+                    # logits2 = self.cam_aux_logits(C2)                 # (B,N,K)
+                    # U_C2 = self._camera_uncertainty(logits2).detach()
+                    # gate_in2 = torch.cat([L2, delta2, mask_tok, U_C2], dim=-1)    # (B,N,2D+1) -> 3D + 1
                     
-                #     # gate_in2 = torch.cat([L2, delta2, mask_tok, C2], dim=-1)    # (B,N,2D+1) -> 3D + 1
+                    # gate_in2 = torch.cat([L2, delta2, mask_tok, C2], dim=-1)    # (B,N,2D+1) -> 3D + 1
                     
-                #     # gate_in2 = torch.cat([L2, delta2, mask_tok], dim=-1)
-                #     # g2 = torch.sigmoid(self.gate_proj(gate_in2))                # (B,N,1)
+                    gate_in2 = torch.cat([L2, delta2, mask_tok], dim=-1)
+                    g2 = torch.sigmoid(self.gate_proj(gate_in2))                # (B,N,1)
 
-                #     # logging
-                #     # with torch.no_grad():
-                #     #     self.last_tokgate["S2"]["g_mean"] = float(g2.mean().item())
-                #     #     self.last_tokgate["S2"]["g_std"]  = float(g2.std(unbiased=False).item())
-                #     #     self.last_tokgate_map["S2"] = g2.view(B, Hp, Wp, 1).permute(0,3,1,2).contiguous().detach()
+                    # g_eff2 = self.alpha + (1-self.alpha)*g2
+
+                    # logging
+                    with torch.no_grad():
+                        g_mean = float(g2.mean().item())
+                        g_std  = float(g2.std(unbiased=False).item())
+
+                        # Δ norm
+                        d_norm = float(delta2.norm(dim=-1).mean().item())
+
+                        # 실제 적용된 update norm = ||(g*M)*Δ||
+                        upd_norm = float(((g2 * mask_tok) * delta2).norm(dim=-1).mean().item())
+
+                        self.last_tokgate["S2"]["g_mean"] = g_mean
+                        self.last_tokgate["S2"]["g_std"]  = g_std
+                        self.last_tokgate["S2"]["d_norm"] = d_norm
+                        self.last_tokgate["S2"]["upd_norm"] = upd_norm
+
+                        self.last_tokgate_map["S2"] = g2.view(B, Hp, Wp, 1).permute(0,3,1,2).contiguous().detach()
 
 
-                #     # L2p = L2 + (g2 * mask_tok) * delta2                         # (B,N,D)
-                #     # L2p = L2 + self.alpha*(mask_tok * delta2)
-                #     # L2p = L2 + (mask_tok * delta2)
-
-                #     L2p = L2
-                #     activation_result_xyz_updated = torch.cat([cls_xyz2, L2p], dim=1)  # (B,1+N,D)
-
-                #     # assemble할 때 업데이트된 xyz 토큰 사용
-                #     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
-                #     reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz_updated)
-
-                # elif i == 0:
-                #     # cwt_cam0 = self.cwt(activation_result_rgb)
-                #     # cwt_xyz0 = self.cwt(activation_result_xyz)                  # mask 미적용
-                #     # cls_token_stage0 = torch.cat([cwt_cam0, cwt_xyz0], dim=1)
-                #     # ctsa_out0 = self.ctsa(cls_token_stage0)
-
-                #     cls_xyz0 = activation_result_xyz[:, :1, :]
-                #     L0 = activation_result_xyz[:, 1:, :]
-                #     C0 = activation_result_rgb[:, 1:, :]
-
-                #     # delta0 = self.ctca(L0, ctsa_out0)                           # mask 미적용
                     
-                #     # CTCA heatmap
-                #     # with torch.no_grad():
-                #     #     # delta: (B, N, D)
-                #     #     delta_norm0 = torch.norm(delta0, dim=-1)  # (B, N)
-                #     #     self.last_delta_norm0 = delta_norm0       # token space
-                #     #     self.last_delta_hw0   = (Hp, Wp)
+                    L2p = L2 + (g2 * mask_tok) * delta2                         # (B,N,D)
+                    # L2p = L2 + self.alpha*(mask_tok * delta2)
+                    # L2p = L2 + (mask_tok * delta2)
+
+                    # L2p = L2
+                    activation_result_xyz_updated = torch.cat([cls_xyz2, L2p], dim=1)  # (B,1+N,D)
+
+                    # assemble할 때 업데이트된 xyz 토큰 사용
+                    reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
+                    reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz_updated)
+
+                elif i == 0:
+                    cwt_cam0, w_cam0 = self.cwt(activation_result_rgb)
+                    cwt_xyz0, w_xyz0 = self.cwt(activation_result_xyz)                  # mask 미적용
+
+                    # token slot 정규화용
+                    extras['tok_cam_s0'] = cwt_cam0
+                    extras['w_cam_s0']   = w_cam0
+                    extras['tok_xyz_s0'] = cwt_xyz0
+                    extras['w_xyz_s0']   = w_xyz0
+
+                    cls_token_stage0 = torch.cat([cwt_cam0, cwt_xyz0], dim=1)
+                    ctsa_out0 = self.ctsa(cls_token_stage0)
+
+                    cls_xyz0 = activation_result_xyz[:, :1, :]
+                    L0 = activation_result_xyz[:, 1:, :]
+                    C0 = activation_result_rgb[:, 1:, :]
+
+                    delta0 = self.ctca(L0, ctsa_out0)                           # mask 미적용
+
+                    # 클래스 토큰 concat (ctsa)제거 실험 (라이다 토큰으로만 클래스 토큰 생성)
+                    # delta0 = self.ctca(L0, cwt_xyz0)
                     
-                #     # cam uncertainty용
-                #     # logits0 = self.cam_aux_logits(C0)                 # (B,N,K)
-                #     # U_C0 = self._camera_uncertainty(logits0).detach()
-                #     # gate_in0 = torch.cat([L0, delta0, mask_tok, U_C0], dim=-1)    # (B,N,2D+1) -> 3D + 1
+                    # CTCA heatmap
+                    # with torch.no_grad():
+                    #     # delta: (B, N, D)
+                    #     delta_norm0 = torch.norm(delta0, dim=-1)  # (B, N)
+                    #     self.last_delta_norm0 = delta_norm0       # token space
+                    #     self.last_delta_hw0   = (Hp, Wp)
                     
-                #     # gate_in0 = torch.cat([L0, delta0, mask_tok, C0], dim=-1)
+                    # cam uncertainty용
+                    # logits0 = self.cam_aux_logits(C0)                 # (B,N,K)
+                    # U_C0 = self._camera_uncertainty(logits0).detach()
+                    # gate_in0 = torch.cat([L0, delta0, mask_tok, U_C0], dim=-1)    # (B,N,2D+1) -> 3D + 1
                     
-                #     # gate_in0 = torch.cat([L0, delta0, mask_tok], dim=-1)
-                #     # g0 = torch.sigmoid(self.gate_proj(gate_in0))
+                    # gate_in0 = torch.cat([L0, delta0, mask_tok, C0], dim=-1)
+                    
+                    gate_in0 = torch.cat([L0, delta0, mask_tok], dim=-1)
+                    g0 = torch.sigmoid(self.gate_proj(gate_in0))
 
-                #     # logging
-                #     # with torch.no_grad():
-                #     #     self.last_tokgate["S0"]["g_mean"] = float(g0.mean().item())
-                #     #     self.last_tokgate["S0"]["g_std"]  = float(g0.std(unbiased=False).item())
-                #     #     self.last_tokgate_map["S0"] = g0.view(B, Hp, Wp, 1).permute(0,3,1,2).contiguous().detach()
+                    # g_eff0 = self.alpha + (1-self.alpha)*g0
+
+                    # logging
+                    with torch.no_grad():
+                        g_mean = float(g0.mean().item())
+                        g_std  = float(g0.std(unbiased=False).item())
+
+                        d_norm = float(delta0.norm(dim=-1).mean().item())
+                        upd_norm = float(((g0 * mask_tok) * delta0).norm(dim=-1).mean().item())
+
+                        self.last_tokgate["S0"]["g_mean"] = g_mean
+                        self.last_tokgate["S0"]["g_std"]  = g_std
+                        self.last_tokgate["S0"]["d_norm"] = d_norm
+                        self.last_tokgate["S0"]["upd_norm"] = upd_norm
+
+                        self.last_tokgate_map["S0"] = g0.view(B, Hp, Wp, 1).permute(0,3,1,2).contiguous().detach()
 
 
-                #     # L0p = L0 + (g0 * mask_tok) * delta0
-                #     # L0p = L0 + (mask_tok * delta0)
-                #     # L0p = L0 + self.alpha*(mask_tok * delta0)
+                    
+                    L0p = L0 + (g0 * mask_tok) * delta0
+                    # L0p = L0 + (mask_tok * delta0)
+                    # L0p = L0 + self.alpha*(mask_tok * delta0)
 
-                #     L0p = L0
-                #     activation_result_xyz_updated = torch.cat([cls_xyz0, L0p], dim=1)
+                    # L0p = L0
+                    activation_result_xyz_updated = torch.cat([cls_xyz0, L0p], dim=1)
 
-                #     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
-                #     reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz_updated)
+                    reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
+                    reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz_updated)
 
-                # else:
-                    # reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
-                    # reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz)
+                else:
+                    reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
+                    reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz)
 
                 # else:
                 #     # stage 3,1에서는 CWT/CTCA 없이 token-level denoise만 적용
@@ -331,7 +386,10 @@ class CLFT(nn.Module):
         #     extras["aux_logits_s2"] = logits2
         #     extras["aux_logits_s0"] = logits0
 
-        return out_depth, out_segmentation, # extras
+        if return_extras:
+            return out_depth, out_segmentation, extras # extras: token slot 정규화용
+        else:
+            return out_depth, out_segmentation
 
     def _get_layers_from_hooks(self, hooks):
         def get_activation(name):

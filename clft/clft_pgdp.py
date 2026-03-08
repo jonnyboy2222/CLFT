@@ -13,7 +13,7 @@ class PGDP(nn.Module):
 
         # --- sigma를 feature 채널로 맞춰서 add 하기 위한 projection ---
         # (sigma_channels=1이면 1x1 conv로 C채널로 확장)
-        self.sigma_proj = nn.Conv2d(sigma_channels, feat_channels, kernel_size=1, padding=0, bias=True)
+        # self.sigma_proj = nn.Conv2d(sigma_channels, feat_channels, kernel_size=1, padding=0, bias=True)
 
         # --- conv 입력은 feat_channels 그대로 ---
         in_channels = feat_channels
@@ -50,7 +50,7 @@ class PGDP(nn.Module):
         self.proj_f2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=True)
         self.proj_f1 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=True)        
 
-    def forward(self, stage2, stage1, stage0, sigma):
+    def forward(self, stage2, stage1, stage0):
         '''
         - Stage2, 1, 0과 sigma 전달받기
         - sigma는 stage feature size에 맞춰 downsampling
@@ -60,20 +60,24 @@ class PGDP(nn.Module):
         '''
 
         # --- sigma를 각 stage 해상도로 맞추고, 채널을 feat_channels로 projection ---
-        sigma2 = F.interpolate(sigma, size=stage2.shape[-2:], mode="bilinear", align_corners=False)
-        sigma1 = F.interpolate(sigma, size=stage1.shape[-2:], mode="bilinear", align_corners=False)
-        sigma0 = F.interpolate(sigma, size=stage0.shape[-2:], mode="bilinear", align_corners=False)
+        # sigma2 = F.interpolate(sigma, size=stage2.shape[-2:], mode="bilinear", align_corners=False)
+        # sigma1 = F.interpolate(sigma, size=stage1.shape[-2:], mode="bilinear", align_corners=False)
+        # sigma0 = F.interpolate(sigma, size=stage0.shape[-2:], mode="bilinear", align_corners=False)
 
-        sigma2 = self.sigma_proj(sigma2)
-        sigma1 = self.sigma_proj(sigma1)
-        sigma0 = self.sigma_proj(sigma0)
+        # sigma2 = self.sigma_proj(sigma2)
+        # sigma1 = self.sigma_proj(sigma1)
+        # sigma0 = self.sigma_proj(sigma0)
 
-        in2 = stage2 + sigma2
-        in1 = stage1 + sigma1
-        in0 = stage0 + sigma0
+        # in2 = stage2 + sigma2
+        # in1 = stage1 + sigma1
+        # in0 = stage0 + sigma0
+
+        # in2 = torch.cat([stage2, sigma2], dim=1)
+        # in1 = torch.cat([stage1, sigma1], dim=1)
+        # in0 = torch.cat([stage0, sigma0], dim=1)
 
         '''stage2'''
-        conv2_raw = self.conv2(in2)
+        conv2_raw = self.conv2(stage2)
         # M_pd2
         p2 = torch.sigmoid(conv2_raw)
 
@@ -86,7 +90,7 @@ class PGDP(nn.Module):
         
 
         '''stage1'''
-        conv1_raw = self.conv1(in1)
+        conv1_raw = self.conv1(stage1)
         # stage0과 합칠 feature
         conv1_up_s0 = self.up1_to_0(conv1_raw)
         conv1_ref0 = self.proj1(conv1_up_s0)
@@ -99,7 +103,7 @@ class PGDP(nn.Module):
         p1 = torch.sigmoid(fused2_1)
 
         '''stage0'''
-        conv0_raw = self.conv0(in0)
+        conv0_raw = self.conv0(stage0)
 
         # skip connection
         fused_all = conv2_ref0 + conv1_ref0 + conv0_raw

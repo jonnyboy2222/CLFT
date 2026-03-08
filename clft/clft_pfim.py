@@ -23,7 +23,7 @@ def gaussian_interval(x, mu, sigma, half_bin=float(0.5), eps=float(1e-12)):
 
 
 class PFIM(nn.Module):
-    def __init__(self, in_channels, hidden_channels, eps_sigma=float(0.1)):
+    def __init__(self, in_channels, hidden_channels, eps_sigma=float(0.01)):
         super().__init__()
 
         self.eps_sigma = eps_sigma
@@ -40,8 +40,9 @@ class PFIM(nn.Module):
         )
 
 
-    def forward(self, x):
-        mu = self.mu_conv(x)
+    def forward(self, x, gain_gate=None):
+        # mu = self.mu_conv(x)
+        mu = x.detach()
         sig = self.sig_conv(x)
         # 확률분포 파라미터 양수화 (sigma는 음수가 되면 안되는데 conv출력은 음수도 반환)
         # softplus(z)=log(1+e^z)
@@ -73,7 +74,28 @@ class PFIM(nn.Module):
         #     loss = (nll * w).sum() / (w.sum() + 1e-12)
 
         info_map = sigma.mean(dim=1, keepdim=True)
-        y1 = x * (1 + info_map)
+        # y1 = x * (1 + info_map)
+
+        # gain gate추가 (증폭을 객체쪽으로 하도록 수행)
+        if gain_gate is not None:
+            if gain_gate.ndim == 3:
+                gain_gate = gain_gate.unsqueeze(1)
+            gain_gate = gain_gate.to(dtype=info_map.dtype, device=info_map.device)
+
+            if gain_gate.shape[-2:] != info_map.shape[-2:]:
+                gain_gate = F.interpolate(
+                    gain_gate,
+                    size=info_map.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False
+                )
+
+            gain_gate = gain_gate.clamp(0.0, 1.0)
+            gain = 1.0 + info_map * gain_gate
+        else:
+            gain = 1.0 + info_map
+
+        y1 = x * gain
 
         with torch.no_grad():
             info = info_map

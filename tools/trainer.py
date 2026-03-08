@@ -44,7 +44,7 @@ class Trainer(object):
         self.pgdp_gt_builder = PGDPBuilderGT(refine=True)
         self.pgdp_loss_fn = PGDPLoss()
 
-        self.pfim_lambda = 0.01
+        self.pfim_lambda = 0.1
         self.pgdp_lambda = 0.1
 
         # human-only dice
@@ -150,6 +150,8 @@ class Trainer(object):
         modality = modal
         early_stopping = EarlyStopping(self.config)
         self.model.train()
+
+        torch.autograd.set_detect_anomaly(True)
         for epoch in range(self.finished_epochs, epochs):
             lr = adjust_learning_rate_clft(self.config, self.optimizer_clft, epoch)
             print('Epoch: {:.0f}, LR: {:.6f}'.format(epoch, lr))
@@ -187,7 +189,7 @@ class Trainer(object):
                 self.optimizer_clft.zero_grad(set_to_none=True)
 
                 with autocast(enabled=self.use_amp, device_type="cuda"):
-                    _, output_seg, extras_rgb, extras_xyz = self.model(batch['rgb'], batch['lidar'], modality)
+                    _, output_seg, extras_rgb = self.model(batch['rgb'], batch['lidar'], modality)
 
                 # 1xHxW -> HxW
                 # output_seg = output_seg.squeeze(1)
@@ -219,7 +221,7 @@ class Trainer(object):
 
                     # rgb
                     # PFIM loss (scalar)
-                    pfim_loss_rgb = extras_rgb["pfim_loss_rgb"]
+                    # pfim_loss_rgb = extras_rgb["pfim_loss_rgb"]
 
                     # PGDP GT & loss
                     gt = self.pgdp_gt_builder(anno)              # {"M_gt","weights","valid"}
@@ -230,22 +232,25 @@ class Trainer(object):
 
                     # xyz
                     # PFIM loss (scalar)
-                    pfim_loss_xyz = extras_xyz["pfim_loss_xyz"]
+                    # pfim_loss_xyz = extras_xyz["pfim_loss_xyz"]
 
                     # PGDP GT & loss
-                    pgdp_loss_xyz, pgdp_logs_xyz = self.pgdp_loss_fn(
-                        extras_xyz["p2_xyz"], extras_xyz["p1_xyz"], extras_xyz["p0_xyz"], gt
-                    )                                           # returns (total, logs)
+                    # pgdp_loss_xyz, pgdp_logs_xyz = self.pgdp_loss_fn(
+                    #     extras_xyz["p2_xyz"], extras_xyz["p1_xyz"], extras_xyz["p0_xyz"], gt
+                    # )                                           # returns (total, logs)
 
-                    pfim_applied = self.pfim_lambda * (0.5 * (pfim_loss_rgb + pfim_loss_xyz))
-                    pgdp_applied = self.pgdp_lambda * (0.5 * (pgdp_loss_rgb + pgdp_loss_xyz))
+                    # update
+                    # pfim_applied = self.pfim_lambda * (0.5 * (pfim_loss_rgb + pfim_loss_xyz))
+                    # pgdp_applied = self.pgdp_lambda * (0.5 * (pgdp_loss_rgb + pgdp_loss_xyz))
 
+                    # pfim_applied = self.pfim_lambda * pfim_loss_rgb
+                    pgdp_applied = self.pgdp_lambda * pgdp_loss_rgb
 
 
                     # total
                     # loss = ce_loss + dice_applied + pfim_applied + pgdp_applied
 
-                    loss = ce_loss + pfim_applied + pgdp_applied
+                    loss = ce_loss + pgdp_applied
 
                     # # ===== Human stabilization losses (FP suppression + Dice) =====
                     # HUMAN_ID = 2
@@ -317,17 +322,17 @@ class Trainer(object):
                         # weighted shares (모달 평균으로 스케일 맞춤)
                         ce_w = float(ce_loss.detach().item())
 
-                        pfim_w = float(self.pfim_lambda * 0.5 * (
-                            extras_rgb["pfim_loss_rgb"].detach().item() +
-                            extras_xyz["pfim_loss_xyz"].detach().item()
-                        ))
+                        # pfim_w = float(self.pfim_lambda * 0.5 * (
+                        #     extras_rgb["pfim_loss_rgb"].detach().item() #+
+                        #     # extras_xyz["pfim_loss_xyz"].detach().item()
+                        # ))
 
                         pgdp_w = float(self.pgdp_lambda * 0.5 * (
-                            pgdp_loss_rgb.detach().item() +
-                            pgdp_loss_xyz.detach().item()
+                            pgdp_loss_rgb.detach().item() #+
+                            # pgdp_loss_xyz.detach().item()
                         ))
 
-                        tot = ce_w + pfim_w + pgdp_w + 1e-12
+                        tot = ce_w + pgdp_w + 1e-12
 
                         # ---- RGB/XYZ scalar logs from extras ----
                         info_m_rgb = float(extras_rgb.get("info_mean_rgb", 0.0))
@@ -336,52 +341,63 @@ class Trainer(object):
                         p0_p95_rgb = float(extras_rgb.get("p0_p95_rgb", 0.0))
                         dr_rgb = float(extras_rgb.get("delta_ratio_rgb", 0.0))
 
-                        info_m_xyz = float(extras_xyz.get("info_mean_xyz", 0.0))
-                        info_p95_xyz = float(extras_xyz.get("info_p95_xyz", 0.0))
-                        p0_m_xyz = float(extras_xyz.get("p0_mean_xyz", 0.0))
-                        p0_p95_xyz = float(extras_xyz.get("p0_p95_xyz", 0.0))
-                        dr_xyz = float(extras_xyz.get("delta_ratio_xyz", 0.0))
+                        # info_m_xyz = float(extras_xyz.get("info_mean_xyz", 0.0))
+                        # info_p95_xyz = float(extras_xyz.get("info_p95_xyz", 0.0))
+                        # p0_m_xyz = float(extras_xyz.get("p0_mean_xyz", 0.0))
+                        # p0_p95_xyz = float(extras_xyz.get("p0_p95_xyz", 0.0))
+                        # dr_xyz = float(extras_xyz.get("delta_ratio_xyz", 0.0))
 
                         # loss share
-                        print(f"[LOSS] ce={ce_w:.4f} pfim_w={pfim_w:.4f} pgdp_w={pgdp_w:.4f} | "
-                            f"pfim_share={pfim_w/tot:.2%} pgdp_share={pgdp_w/tot:.2%}")
+                        # print(f"[LOSS] ce={ce_w:.4f} pfim_w={pfim_w:.4f} pgdp_w={pgdp_w:.4f} | "
+                        #     f"pfim_share={pfim_w/tot:.2%} pgdp_share={pgdp_w/tot:.2%}")
 
                         # PFIM (rgb/xyz)
-                        print(f"[PFIM_RGB] loss={float(extras_rgb['pfim_loss_rgb'].detach().item()):.4f} | "
-                            f"info(m,p95)={info_m_rgb:.3f},{info_p95_rgb:.3f} | "
-                            f"delta_ratio={dr_rgb:.4f}")
+                        # print(f"[PFIM_RGB] loss={float(extras_rgb['pfim_loss_rgb'].detach().item()):.4f} | "
+                        #     f"info(m,p95)={info_m_rgb:.3f},{info_p95_rgb:.3f} | "
+                        #     f"delta_ratio={dr_rgb:.4f}")
 
-                        print(f"[PFIM_XYZ] loss={float(extras_xyz['pfim_loss_xyz'].detach().item()):.4f} | "
-                            f"info(m,p95)={info_m_xyz:.3f},{info_p95_xyz:.3f} | "
-                            f"delta_ratio={dr_xyz:.4f}")
+                        # print(f"[PFIM_XYZ] loss={float(extras_xyz['pfim_loss_xyz'].detach().item()):.4f} | "
+                        #     f"info(m,p95)={info_m_xyz:.3f},{info_p95_xyz:.3f} | "
+                        #     f"delta_ratio={dr_xyz:.4f}")
 
                         # PGDP (rgb/xyz) : p0 fg stats는 extras에 들어있음
                         print(f"[PGDP_RGB] loss={float(pgdp_loss_rgb.detach().item()):.4f} | "
                             f"p0_fg(m,p95)={p0_m_rgb:.3f},{p0_p95_rgb:.3f}")
 
-                        print(f"[PGDP_XYZ] loss={float(pgdp_loss_xyz.detach().item()):.4f} | "
-                            f"p0_fg(m,p95)={p0_m_xyz:.3f},{p0_p95_xyz:.3f}")
+                        # print(f"[PGDP_XYZ] loss={float(pgdp_loss_xyz.detach().item()):.4f} | "
+                        #     f"p0_fg(m,p95)={p0_m_xyz:.3f},{p0_p95_xyz:.3f}")
                             
                 # ===== accumulate PP diagnostics per batch (epoch average) =====
                 with torch.no_grad():
                     # 모달 평균
-                    pfim_loss_mean = 0.5 * (pfim_loss_rgb + pfim_loss_xyz)
-                    pgdp_loss_mean = 0.5 * (pgdp_loss_rgb + pgdp_loss_xyz)
+                    # pfim_loss_mean = 0.5 * (pfim_loss_rgb + pfim_loss_xyz)
+                    # pgdp_loss_mean = 0.5 * (pgdp_loss_rgb + pgdp_loss_xyz)
 
-                    info_mean = 0.5 * (extras_rgb.get("info_mean_rgb", 0.0) + extras_xyz.get("info_mean_xyz", 0.0))
-                    info_p95  = 0.5 * (extras_rgb.get("info_p95_rgb", 0.0)  + extras_xyz.get("info_p95_xyz", 0.0))
+                    # info_mean = 0.5 * (extras_rgb.get("info_mean_rgb", 0.0) + extras_xyz.get("info_mean_xyz", 0.0))
+                    # info_p95  = 0.5 * (extras_rgb.get("info_p95_rgb", 0.0)  + extras_xyz.get("info_p95_xyz", 0.0))
 
-                    p0_mean = 0.5 * (extras_rgb.get("p0_mean_rgb", 0.0) + extras_xyz.get("p0_mean_xyz", 0.0))
-                    p0_p95  = 0.5 * (extras_rgb.get("p0_p95_rgb", 0.0)  + extras_xyz.get("p0_p95_xyz", 0.0))
+                    # p0_mean = 0.5 * (extras_rgb.get("p0_mean_rgb", 0.0) + extras_xyz.get("p0_mean_xyz", 0.0))
+                    # p0_p95  = 0.5 * (extras_rgb.get("p0_p95_rgb", 0.0)  + extras_xyz.get("p0_p95_xyz", 0.0))
 
-                    delta_ratio = 0.5 * (extras_rgb.get("delta_ratio_rgb", 0.0) + extras_xyz.get("delta_ratio_xyz", 0.0))
+                    # delta_ratio = 0.5 * (extras_rgb.get("delta_ratio_rgb", 0.0) + extras_xyz.get("delta_ratio_xyz", 0.0))
+
+                    # pfim_loss_mean = pfim_loss_rgb
+                    pgdp_loss_mean = pgdp_loss_rgb
+
+                    # info_mean = extras_rgb.get("info_mean_rgb", 0.0)
+                    # info_p95  = extras_rgb.get("info_p95_rgb", 0.0)
+
+                    p0_mean = extras_rgb.get("p0_mean_rgb", 0.0)
+                    p0_p95  = extras_rgb.get("p0_p95_rgb", 0.0)
+
+                    delta_ratio = extras_rgb.get("delta_ratio_rgb", 0.0)
 
                     # CSV에 맞는 필드만 채움 (없는 필드는 0 유지)
-                    diag_sum["pfim_loss"] += _sf(pfim_loss_mean)
+                    # diag_sum["pfim_loss"] += _sf(pfim_loss_mean)
                     diag_sum["pgdp_total"] += _sf(pgdp_loss_mean)
 
-                    diag_sum["info_mean"] += _sf(info_mean)
-                    diag_sum["info_p95"]  += _sf(info_p95)
+                    # diag_sum["info_mean"] += _sf(info_mean)
+                    # diag_sum["info_p95"]  += _sf(info_p95)
 
                     diag_sum["p0_mean"] += _sf(p0_mean)
                     diag_sum["p0_p95"]  += _sf(p0_p95)
@@ -393,7 +409,7 @@ class Trainer(object):
                     diag_sum["pix_ratio_v"] += _sf(ratio_v)
 
                     # max tracker도 평균 기준으로
-                    diag_max["info_p95_max"] = max(diag_max["info_p95_max"], _sf(info_p95))
+                    # diag_max["info_p95_max"] = max(diag_max["info_p95_max"], _sf(info_p95))
                     diag_max["p0_p95_max"]   = max(diag_max["p0_p95_max"], _sf(p0_p95))
 
                     diag_cnt += 1
@@ -475,7 +491,7 @@ class Trainer(object):
                 batch['anno'] = batch['anno'].to(self.device, non_blocking=True)
 
                 with autocast(enabled=self.use_amp, device_type="cuda"):
-                    _, output_seg, extras_rgb, extras_xyz = self.model(batch['rgb'], batch['lidar'], modal)
+                    _, output_seg, extras_rgb = self.model(batch['rgb'], batch['lidar'], modal)
 
                 # 1xHxW -> HxW
                 # output_seg = output_seg.squeeze(1)
@@ -507,7 +523,7 @@ class Trainer(object):
 
                     # rgb
                     # PFIM loss (scalar)
-                    pfim_loss_rgb = extras_rgb["pfim_loss_rgb"]
+                    # pfim_loss_rgb = extras_rgb["pfim_loss_rgb"]
 
                     # PGDP GT & loss
                     gt = self.pgdp_gt_builder(anno)              # {"M_gt","weights","valid"}
@@ -518,22 +534,26 @@ class Trainer(object):
 
                     # xyz
                     # PFIM loss (scalar)
-                    pfim_loss_xyz = extras_xyz["pfim_loss_xyz"]
+                    # pfim_loss_xyz = extras_xyz["pfim_loss_xyz"]
 
                     # PGDP GT & loss
-                    pgdp_loss_xyz, pgdp_logs_xyz = self.pgdp_loss_fn(
-                        extras_xyz["p2_xyz"], extras_xyz["p1_xyz"], extras_xyz["p0_xyz"], gt
-                    )                                           # returns (total, logs)
+                    # pgdp_loss_xyz, pgdp_logs_xyz = self.pgdp_loss_fn(
+                    #     extras_xyz["p2_xyz"], extras_xyz["p1_xyz"], extras_xyz["p0_xyz"], gt
+                    # )                                           # returns (total, logs)
 
-                    pfim_applied = self.pfim_lambda * (0.5 * (pfim_loss_rgb + pfim_loss_xyz))
-                    pgdp_applied = self.pgdp_lambda * (0.5 * (pgdp_loss_rgb + pgdp_loss_xyz))
+                    # update
+                    # pfim_applied = self.pfim_lambda * (0.5 * (pfim_loss_rgb + pfim_loss_xyz))
+                    # pgdp_applied = self.pgdp_lambda * (0.5 * (pgdp_loss_rgb + pgdp_loss_xyz))
+
+                    # pfim_applied = self.pfim_lambda * pfim_loss_rgb
+                    pgdp_applied = self.pgdp_lambda * pgdp_loss_rgb
 
 
 
                     # total
                     # loss = ce_loss + dice_applied + pfim_applied + pgdp_applied
 
-                    loss = ce_loss + pfim_applied + pgdp_applied
+                    loss = ce_loss + pgdp_applied
 
                 valid_loss += loss.item()
                 progress_bar.set_description(f'valid fusion loss: {loss:.4f}')

@@ -7,7 +7,7 @@ import numpy as np
 
 from torch.utils.data import DataLoader
 
-from tools.trainer import Trainer
+from tools.trainer_ctca_fusion import Trainer
 from tools.dataset import Dataset
 
 
