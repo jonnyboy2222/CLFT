@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from tools.dataset import Dataset
-from clft_ctca_fusion.clft import CLFT
+from clft.clft import CLFT
 
 
 # ==========================================================

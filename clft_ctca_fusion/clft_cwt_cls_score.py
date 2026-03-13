@@ -9,7 +9,7 @@ class CWT(nn.Module):
     Input   : (B, N, D)     ViT patch embedding(including class token itself)
     Output  : (B, K, D)     where K = num_classes
     """
-    def __init__(self, emb_dim=768, num_classes=2, hidden=256, temp=1.0):
+    def __init__(self, emb_dim=768, num_classes=3, hidden=256, temp=1.0):
         super(CWT, self).__init__()
         self.temp = float(temp)
 

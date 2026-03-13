@@ -5,14 +5,14 @@ import timm
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
-from clft_ctca_fusion.reassemble import Reassemble
-from clft_ctca_fusion.fusion import Fusion
-from clft_ctca_fusion.head import HeadDepth, HeadSeg
+from clft.reassemble import Reassemble
+from clft.fusion import Fusion
+from clft.head import HeadDepth, HeadSeg
 
-from clft_ctca_fusion.clft_cwt_cls_score import CWT
-from clft_ctca_fusion.clft_ctsa import CTSA
-from clft_ctca_fusion.clft_ctca import CTCA
-from clft_ctca_fusion.clft_mask import patch_mask_from_lidar, apply_token_mask_to_vit_emb
+from clft.clft_cwt_attn import CWT
+from clft.clft_ctsa import CTSA
+from clft.clft_ctca import CTCA
+from clft.clft_mask import patch_mask_from_lidar, apply_token_mask_to_vit_emb
 
 
 torch.manual_seed(0)
