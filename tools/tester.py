@@ -10,7 +10,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from clfcn.fusion_net import FusionNet
 from utils.metrics import find_overlap
 from utils.metrics import auc_ap
-from clft.clft import CLFT
+from clft_ctca_fusion.clft import CLFT
 
 
 class Tester(object):
@@ -72,7 +72,7 @@ class Tester(object):
                 batch['lidar'] = batch['lidar'].to(self.device, non_blocking=True)
                 batch['anno'] = batch['anno'].to(self.device, non_blocking=True)
 
-                _, output_seg, extras_rgb, extras_xyz = self.model(batch['rgb'], batch['lidar'], modality)
+                _, output_seg, extras_rgb = self.model(batch['rgb'], batch['lidar'], modality)
 
                 # 1xHxW -> HxW
                 output_seg = output_seg.squeeze(1)

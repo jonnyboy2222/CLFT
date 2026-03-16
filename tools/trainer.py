@@ -60,9 +60,9 @@ class Trainer(object):
         # ===== Logs directory (relative to trainer.py) =====
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.logs_dir = os.path.abspath(os.path.join(base_dir, "../logs"))
-        self.log_path = os.path.join(self.logs_dir, "pp_diagnostics.csv")
+        self.log_path = os.path.join(self.logs_dir, "gs_diagnostics.csv")
 
-        self.pp_csv_header = [
+        self.gs_csv_header = [
             "epoch",
             "sdup_loss",
             "gdmp_total",
@@ -80,7 +80,7 @@ class Trainer(object):
         if not os.path.exists(self.log_path):
             with open(self.log_path, "w", newline="") as f:
                 csv_writer = csv.writer(f)
-                csv_writer.writerow(self.pp_csv_header)
+                csv_writer.writerow(self.gs_csv_header)
 
         if args.backbone == 'clfcn':
             self.model = FusionNet()
@@ -163,7 +163,7 @@ class Trainer(object):
             progress_bar = tqdm(train_dataloader)
 
             # ===== PFIM/GDMP epoch diagnostics accumulator =====
-            diag_sum = {k: 0.0 for k in self.pp_csv_header if k != "epoch"}
+            diag_sum = {k: 0.0 for k in self.gs_csv_header if k != "epoch"}
             diag_cnt = 0
 
             # epoch 내 runaway/포화를 놓치지 않기 위한 max tracker
@@ -253,19 +253,19 @@ class Trainer(object):
 
                     inter_h = ((pred == 2) & (anno == 2)).sum().item()
 
-                    if i % 50 == 0:
+                    if i % 20 == 0:
                         print(f"[PIX] gt_v={gt_v} pred_v={pr_v} | gt_h={gt_h} pred_h={pr_h} | "
                               f"ratio_v={ratio_v:.3f} ratio_h={ratio_h:.3f}")
 
                         # weighted shares (모달 평균으로 스케일 맞춤)
-                        ce_w = float(ce_loss.detach().item())
+                        # ce_w = float(ce_loss.detach().item())
 
-                        gdmp_w = float(self.gdmp_lambda * 0.5 * (
-                            gdmp_loss_rgb.detach().item() #+
-                            # gdmp_loss_xyz.detach().item()
-                        ))
+                        # gdmp_w = float(self.gdmp_lambda * 0.5 * (
+                        #     gdmp_loss_rgb.detach().item() #+
+                        #     # gdmp_loss_xyz.detach().item()
+                        # ))
 
-                        tot = ce_w + gdmp_w + 1e-12
+                        # tot = ce_w + gdmp_w + 1e-12
 
                         # ---- RGB scalar logs from extras ----
                         p0_m_rgb = float(extras_rgb.get("p0_mean_rgb", 0.0))
@@ -356,7 +356,7 @@ class Trainer(object):
             # CSV append: header 순서대로 저장
             with open(self.log_path, "a", newline="") as f:
                 csv_writer = csv.writer(f)
-                csv_writer.writerow([epoch] + [diag_avg[k] for k in self.pp_csv_header if k != "epoch"])
+                csv_writer.writerow([epoch] + [diag_avg[k] for k in self.gs_csv_header if k != "epoch"])
 
 
 

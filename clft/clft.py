@@ -298,36 +298,6 @@ class CLFT(nn.Module):
             out_segmentation = self.head_segmentation(previous_stage)
 
         return out_depth, out_segmentation, extras_rgb # , extras_xyz
-    
-    
-    # def _build_pfim_gain_gate(self, anno, out_hw, ignore_index=4,
-    #                           fg_weight=0.25, bd_weight=0.75):
-    #     """
-    #     anno: (B,H,W) or (B,1,H,W)
-    #     out_hw: (H_out, W_out)
-    #     return: (B,1,H_out,W_out) in [0,1]
-    #     """
-    #     if anno is None:
-    #         return None
-
-    #     if anno.ndim == 4 and anno.size(1) == 1:
-    #         anno = anno.squeeze(1)   # (B,H,W)
-
-    #     # foreground: car/human only, ignore 제외
-    #     fg = ((anno > 0) & (anno != ignore_index)).float().unsqueeze(1)   # (B,1,H,W)
-
-    #     # stage0 resolution으로 다운샘플
-    #     fg = F.interpolate(fg, size=out_hw, mode="nearest")
-
-    #     # soft boundary: avg가 0.5 부근일수록 큼
-    #     avg = F.avg_pool2d(fg, kernel_size=3, stride=1, padding=1)
-    #     boundary_soft = 4.0 * avg * (1.0 - avg)   # [0,1], 경계 부근에서 peak
-
-    #     # object interior도 약하게 살려두고, boundary를 더 강조
-    #     gate = fg_weight * fg + bd_weight * boundary_soft
-    #     gate = gate.clamp(0.0, 1.0)
-
-    #     return gate
 
     def _get_layers_from_hooks(self, hooks):
         def get_activation(name):

@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from clfcn.fusion_net import FusionNet
 from utils.metrics import find_overlap
 from utils.metrics import find_overlap_1
-from clft.clft import CLFT
+from clft_ctca_fusion.clft import CLFT
 from utils.helpers import EarlyStopping
 from utils.helpers import save_model_dict
 from utils.helpers import adjust_learning_rate_clft
@@ -22,10 +22,9 @@ from torch.amp import autocast, GradScaler
 import os, csv
 from pathlib import Path
 
-from tools.clft_gdmp_gt import PGDPBuilderGT
-from tools.clft_gdmp_loss import PGDPLoss
-from tools.clft_sdup_loss import _build_sdup_target
-from tools.clft_gdmp_loss import dice_loss_softmax
+from tools.clft_pgdp_gt import PGDPBuilderGT
+from tools.clft_pgdp_loss import PGDPLoss
+from tools.clft_pgdp_loss import dice_loss_softmax
 
 
 writer = SummaryWriter()
@@ -45,8 +44,7 @@ class Trainer(object):
         self.pgdp_gt_builder = PGDPBuilderGT(refine=True)
         self.pgdp_loss_fn = PGDPLoss()
 
-        # self.pfim_lambda = 0.1
-        self.sdup_lambda = 0.05
+        self.pfim_lambda = 0.1
         self.pgdp_lambda = 0.1
 
         # human-only dice
@@ -64,11 +62,11 @@ class Trainer(object):
 
         self.pp_csv_header = [
             "epoch",
-            "sdup_loss",
+            "pfim_loss",
             "pgdp_total",
-            "u_mean",
-            "u_p95",
-            "u_p95_max",
+            "info_mean",
+            "info_p95",
+            "info_p95_max",
             "p0_mean",
             "p0_p95",
             "p0_p95_max",
@@ -168,7 +166,7 @@ class Trainer(object):
 
             # epoch 내 runaway/포화를 놓치지 않기 위한 max tracker
             diag_max = {
-                "u_p95_max": 0.0,
+                "info_p95_max": 0.0,
                 "p0_p95_max": 0.0,
             }
 
@@ -232,17 +230,6 @@ class Trainer(object):
                         extras_rgb["p2_rgb"], extras_rgb["p1_rgb"], extras_rgb["p0_rgb"], gt
                     )                                           # returns (total, logs)
 
-                    # SDUP loss
-                    u_map_rgb = extras_rgb["u_map_rgb"]   # (B,1,H0,W0)
-
-                    target_u_rgb = _build_sdup_target(
-                        output_seg=output_seg,
-                        p0_rgb=extras_rgb["p0_rgb"],
-                        u_map_rgb=u_map_rgb
-                    )
-
-                    sdup_loss_rgb = F.l1_loss(u_map_rgb, target_u_rgb)
-
                     # xyz
                     # PFIM loss (scalar)
                     # pfim_loss_xyz = extras_xyz["pfim_loss_xyz"]
@@ -257,17 +244,13 @@ class Trainer(object):
                     # pgdp_applied = self.pgdp_lambda * (0.5 * (pgdp_loss_rgb + pgdp_loss_xyz))
 
                     # pfim_applied = self.pfim_lambda * pfim_loss_rgb
-
                     pgdp_applied = self.pgdp_lambda * pgdp_loss_rgb
-                    sdup_applied = self.sdup_lambda * sdup_loss_rgb
 
 
                     # total
                     # loss = ce_loss + dice_applied + pfim_applied + pgdp_applied
 
-                    # loss = ce_loss + pgdp_applied
-
-                    loss = ce_loss + pgdp_applied + sdup_applied
+                    loss = ce_loss + pgdp_applied
 
                     # # ===== Human stabilization losses (FP suppression + Dice) =====
                     # HUMAN_ID = 2
@@ -358,11 +341,6 @@ class Trainer(object):
                         p0_p95_rgb = float(extras_rgb.get("p0_p95_rgb", 0.0))
                         dr_rgb = float(extras_rgb.get("delta_ratio_rgb", 0.0))
 
-                        u_mean_rgb = float(u_map_rgb.detach().mean().item())
-                        u_p95_rgb = float(torch.quantile(u_map_rgb.detach().flatten(), 0.95).item())
-                        tgt_mean_rgb = float(target_u_rgb.detach().mean().item())
-                        tgt_p95_rgb = float(torch.quantile(target_u_rgb.detach().flatten(), 0.95).item())
-
                         # info_m_xyz = float(extras_xyz.get("info_mean_xyz", 0.0))
                         # info_p95_xyz = float(extras_xyz.get("info_p95_xyz", 0.0))
                         # p0_m_xyz = float(extras_xyz.get("p0_mean_xyz", 0.0))
@@ -385,11 +363,6 @@ class Trainer(object):
                         # PGDP (rgb/xyz) : p0 fg stats는 extras에 들어있음
                         print(f"[PGDP_RGB] loss={float(pgdp_loss_rgb.detach().item()):.4f} | "
                             f"p0_fg(m,p95)={p0_m_rgb:.3f},{p0_p95_rgb:.3f}")
-                        
-                        # SDUP
-                        print(f"[SDUP_RGB] loss={float(sdup_loss_rgb.detach().item()):.4f} | "
-                            f"u(m,p95)={u_mean_rgb:.3f},{u_p95_rgb:.3f} | "
-                            f"tgt(m,p95)={tgt_mean_rgb:.3f},{tgt_p95_rgb:.3f}")
 
                         # print(f"[PGDP_XYZ] loss={float(pgdp_loss_xyz.detach().item()):.4f} | "
                         #     f"p0_fg(m,p95)={p0_m_xyz:.3f},{p0_p95_xyz:.3f}")
@@ -438,15 +411,6 @@ class Trainer(object):
                     # max tracker도 평균 기준으로
                     # diag_max["info_p95_max"] = max(diag_max["info_p95_max"], _sf(info_p95))
                     diag_max["p0_p95_max"]   = max(diag_max["p0_p95_max"], _sf(p0_p95))
-
-                    u_mean_rgb = u_map_rgb.detach().mean()
-                    u_p95_rgb = torch.quantile(u_map_rgb.detach().flatten(), 0.95)
-
-                    diag_sum["sdup_loss"] += _sf(sdup_loss_rgb)
-                    diag_sum["u_mean"] += _sf(u_mean_rgb)
-                    diag_sum["u_p95"]  += _sf(u_p95_rgb)
-
-                    diag_max["u_p95_max"] = max(diag_max["u_p95_max"], _sf(u_p95_rgb))
 
                     diag_cnt += 1
 
@@ -568,16 +532,6 @@ class Trainer(object):
                         extras_rgb["p2_rgb"], extras_rgb["p1_rgb"], extras_rgb["p0_rgb"], gt
                     )                                           # returns (total, logs)
 
-                    u_map_rgb = extras_rgb["u_map_rgb"]
-
-                    target_u_rgb = _build_sdup_target(
-                        output_seg=output_seg,
-                        p0_rgb=extras_rgb["p0_rgb"],
-                        u_map_rgb=u_map_rgb
-                    )
-
-                    sdup_loss_rgb = F.l1_loss(u_map_rgb, target_u_rgb)
-
                     # xyz
                     # PFIM loss (scalar)
                     # pfim_loss_xyz = extras_xyz["pfim_loss_xyz"]
@@ -593,15 +547,13 @@ class Trainer(object):
 
                     # pfim_applied = self.pfim_lambda * pfim_loss_rgb
                     pgdp_applied = self.pgdp_lambda * pgdp_loss_rgb
-                    sdup_applied = self.sdup_lambda * sdup_loss_rgb
 
 
 
                     # total
                     # loss = ce_loss + dice_applied + pfim_applied + pgdp_applied
 
-                    # loss = ce_loss + pgdp_applied
-                    loss = ce_loss + pgdp_applied + sdup_applied
+                    loss = ce_loss + pgdp_applied
 
                 valid_loss += loss.item()
                 progress_bar.set_description(f'valid fusion loss: {loss:.4f}')

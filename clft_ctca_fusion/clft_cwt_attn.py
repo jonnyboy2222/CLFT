@@ -62,6 +62,16 @@ class CWT(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        self.out_norm = nn.LayerNorm(emb_dim)
+        self.ffn_norm = nn.LayerNorm(emb_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim * 4),
+            nn.GELU(),
+            nn.Dropout(proj_drop),
+            nn.Linear(emb_dim * 4, emb_dim),
+            nn.Dropout(proj_drop),
+        )
+
     def forward(self, x: torch.Tensor, mask_tok: torch.Tensor = None, has_cls_token: bool = True):
         # x: (B, N, D)
         if has_cls_token:
@@ -118,6 +128,10 @@ class CWT(nn.Module):
 
         # Residual anchor stabilization (always on)
         class_tokens = q0 + out
+        # token 자체가 한 번 더 semantic mixing 되게 만듦
+        class_tokens = self.out_norm(class_tokens)
+        class_tokens = class_tokens + self.ffn(self.ffn_norm(class_tokens))
+
         attn_mean = attn.mean(dim=1)   # (B, K, Np)
         
         return class_tokens, attn_mean
