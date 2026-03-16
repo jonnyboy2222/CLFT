@@ -117,4 +117,7 @@ class CWT(nn.Module):
         out = self.proj_drop(out)
 
         # Residual anchor stabilization (always on)
-        return q0 + out
+        class_tokens = q0 + out
+        attn_mean = attn.mean(dim=1)   # (B, K, Np)
+        
+        return class_tokens, attn_mean

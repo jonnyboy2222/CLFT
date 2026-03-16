@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from clfcn.fusion_net import FusionNet
 from utils.metrics import find_overlap
 from utils.metrics import find_overlap_1
-from clft_ctca_fusion.clft import CLFT
+from clft.clft import CLFT
 from utils.helpers import EarlyStopping
 from utils.helpers import save_model_dict
 from utils.helpers import adjust_learning_rate_clft
