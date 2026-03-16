@@ -25,7 +25,7 @@ from tools.dataset import Dataset
 from clft.clft import CLFT
 
 # PGDP GT builder (trainer.py에서 쓰는 것과 동일)
-from tools.clft_pgdp_gt import PGDPBuilderGT
+from tools.clft_gdmp_gt import PGDPBuilderGT
 
 
 # ==========================================================

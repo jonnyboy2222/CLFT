@@ -10,9 +10,10 @@ from clft.reassemble import Reassemble
 from clft.fusion import Fusion
 from clft.head import HeadDepth, HeadSeg
 
-from clft.clft_pgdp import PGDP
-from clft.clft_pfim import PFIM
-from clft.clft_cbam import CBAM
+from clft.clft_gdmp import GDMP
+# from clft.clft_pfim import PFIM
+# from clft.clft_cbam import CBAM
+from clft.clft_sdup import SDUP
 
 torch.manual_seed(0)
 
@@ -77,10 +78,15 @@ class CLFT(nn.Module):
         #     in_channels=resample_dim,
         #     hidden_channels=resample_dim // 2
         # )
-        self.pgdp = PGDP(
+        self.gdmp = GDMP(
             feat_channels=resample_dim,
             out_channels=2
         )
+        self.sdup = SDUP(
+            in_channels=resample_dim,
+            hidden_channels=resample_dim // 2
+        )
+
         # self.cbam1_rgb = CBAM(resample_dim)
         # self.cbam2_rgb = CBAM(resample_dim)
 
@@ -160,18 +166,21 @@ class CLFT(nn.Module):
         # y1_rgb, pfim_loss_rgb, info_map_rgb = self.pfim(self.rgb_reassemble[0])
         # y1_xyz, pfim_loss_xyz, info_map_xyz = self.pfim(self.xyz_reassemble[0], gain_gate=pfim_gain_gate)
 
-        # pgdp 실행
-        stage2_pgdp = self.rgb_reassemble[2].clone()
-        stage1_pgdp = self.rgb_reassemble[1].clone()
-        stage0_pgdp = self.rgb_reassemble[0].clone()
+        # SDUP 실행
+        y1_rgb, u_map_rgb = self.sdup(self.rgb_reassemble[0])
 
-        p2_rgb, p1_rgb, p0_rgb, y2_rgb = self.pgdp(
-            stage2_pgdp,
-            stage1_pgdp,
-            stage0_pgdp,
+        # GDMP 실행
+        stage2_gdmp = self.rgb_reassemble[2].clone()
+        stage1_gdmp = self.rgb_reassemble[1].clone()
+        stage0_gdmp = self.rgb_reassemble[0].clone()
+
+        p2_rgb, p1_rgb, p0_rgb, y2_rgb = self.gdmp(
+            stage2_gdmp,
+            stage1_gdmp,
+            stage0_gdmp,
         )
 
-        # p2_xyz, p1_xyz, p0_xyz, y2_xyz = self.pgdp(
+        # p2_xyz, p1_xyz, p0_xyz, y2_xyz = self.gdmp(
         #     self.xyz_reassemble[2],
         #     self.xyz_reassemble[1],
         #     self.xyz_reassemble[0],
@@ -179,8 +188,8 @@ class CLFT(nn.Module):
         # )
         
         '''w/ delta'''
-        # delta_rgb1 = y1_rgb - raw_stage0_rgb
-        # delta_rgb2 = y2_rgb - raw_stage0_rgb
+        delta_rgb1 = y1_rgb - raw_stage0_rgb
+        delta_rgb2 = y2_rgb - raw_stage0_rgb
 
         # delta_xyz1 = y1_xyz - raw_stage0_xyz
         # delta_xyz2 = y2_xyz - raw_stage0_xyz
@@ -207,10 +216,14 @@ class CLFT(nn.Module):
         # updated_s0_rgb = a1_rgb + a2_rgb
         # updated_s0_xyz = a1_xyz + a2_xyz
 
+        updated_s0_rgb = raw_stage0_rgb + delta_rgb1 + delta_rgb2
+
 
         '''update'''
-        self.rgb_reassemble[0] = y2_rgb
+        # self.rgb_reassemble[0] = y2_rgb
         # self.xyz_reassemble[0] = updated_s0_xyz
+
+        self.rgb_reassemble[0] = updated_s0_rgb
 
         previous_stage = None
 
@@ -219,7 +232,7 @@ class CLFT(nn.Module):
             previous_stage = fusion_result
             
 
-        # ===== P&P Diagnostics =====
+        # ===== GS Diagnostics =====
         with torch.no_grad():
             eps = 1e-6
 
@@ -228,7 +241,7 @@ class CLFT(nn.Module):
             # info_mean_rgb = info_map_rgb.mean()
             # info_p95_rgb  = torch.quantile(info_map_rgb.flatten(), 0.95)
 
-            # PGDP foreground prior
+            # GDMP foreground prior
             p0_fg_rgb = p0_rgb.max(dim=1, keepdim=True).values
             p0_mean_rgb = p0_fg_rgb.mean()
             p0_p95_rgb  = torch.quantile(p0_fg_rgb.flatten(), 0.95)
@@ -243,7 +256,7 @@ class CLFT(nn.Module):
             # info_mean_xyz = info_map_xyz.mean()
             # info_p95_xyz  = torch.quantile(info_map_xyz.flatten(), 0.95)
 
-            # PGDP foreground prior
+            # GDMP foreground prior
             # p0_fg_xyz = p0_xyz.max(dim=1, keepdim=True).values
             # p0_mean_xyz = p0_fg_xyz.mean()
             # p0_p95_xyz  = torch.quantile(p0_fg_xyz.flatten(), 0.95)
@@ -262,6 +275,7 @@ class CLFT(nn.Module):
             "p0_mean_rgb": p0_mean_rgb.detach(),
             "p0_p95_rgb": p0_p95_rgb.detach(),
             "delta_ratio_rgb": delta_ratio_rgb.detach(),
+            "u_map_rgb": u_map_rgb
         }
 
         # extras_xyz = {
