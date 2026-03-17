@@ -9,7 +9,7 @@ from clft_ctca_fusion.reassemble import Reassemble
 from clft_ctca_fusion.fusion import Fusion
 from clft_ctca_fusion.head import HeadDepth, HeadSeg
 
-from clft_ctca_fusion.clft_cwt_cam import CWT
+from clft_ctca_fusion.clft_cwt_attn import CWT
 from clft_ctca_fusion.clft_ctsa import CTSA
 from clft_ctca_fusion.clft_ctca import CTCA
 from clft_ctca_fusion.clft_mask import patch_mask_from_lidar, apply_token_mask_to_vit_emb
@@ -50,20 +50,9 @@ class CLFT(nn.Module):
         self.patch_size = patch_size
 
         # cls token 관련 클래스 객체 생성
-        self.cwt = self.cwt = CWT(
-            in_dim=emb_dim,
-            num_classes=nclasses,
-            target_class_idx=[2, 1],   # person, car
-            use_softmax=True,
-            tau=0.10,
-            topk_ratio=0.20,
-            add_class_queries=True,
-        )
+        self.cwt = CWT()
         self.ctsa = CTSA(attn_drop=0.0, proj_drop=0.0)
         self.ctca = CTCA(attn_drop=0.0, proj_drop=0.0)
-
-        # stage2 camera CAM logits head
-        self.cam_proto_head_s2 = nn.Conv2d(resample_dim, nclasses, kernel_size=1)
 
         # g = sigmoid(1x1conv([L, Δ, M]))  -> 토큰별 Linear
         # 입력 채널: [L (D), Δ (D), M (1)] => 2D+1
@@ -200,25 +189,62 @@ class CLFT(nn.Module):
                 reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz)
 
                 if i == 2:
-                    # stage2 feature에서 class prior용 logits 생성
-                    cam_logits_s2 = self.cam_proto_head_s2(reassemble_result_RGB)            # (B,C,H,W)
+                    cwt_cam2, w_cam2 = self.cwt(activation_result_rgb)
+                    # cwt_xyz2, w_xyz2 = self.cwt(activation_result_xyz)        # mask 미적용
 
-                    proto_tokens, cam_maps, present_mask, raw_scores = self.cwt(
-                        reassemble_result_RGB,
-                        cam_logits_s2
-                    )
+                    # token slot 정규화용
+                    extras['tok_cam_s2'] = cwt_cam2
+                    extras['w_cam_s2']   = w_cam2
+                    # extras['tok_xyz_s2'] = cwt_xyz2
+                    # extras['w_xyz_s2']   = w_xyz2
 
-                    extras["proto_tokens_s2"] = proto_tokens
-                    extras["cam_maps_s2"] = cam_maps
-                    extras["present_mask_s2"] = present_mask
-                    extras["raw_scores_s2"] = raw_scores
+                    # cls_token_stage2 = torch.cat([cwt_cam2, cwt_xyz2], dim=1)   # (B, 2K, D) 같은 형태
+                    # ctsa_out2 = self.ctsa(cls_token_stage2)                     # (B, Nk, D)  Nk=2K
+
+                    # ----- CTCA + gated update (LiDAR token update) -----
+                    cls_xyz2 = activation_result_xyz[:, :1, :]                  # (B,1,D)  CLS 고정
+                    L2 = activation_result_xyz[:, 1:, :]                        # (B,N,D)
+                    C2 = activation_result_rgb[:, 1:, :]
+
+                    # delta2 = self.ctca(L2, ctsa_out2)                           # (B,N,D)  Δ, mask 미적용
+                    delta2 = self.ctca(L2, cwt_cam2)
+
+                    # 클래스 토큰 concat (ctsa)제거 실험 (라이다 토큰으로만 클래스 토큰 생성)
+                    # delta2 = self.ctca(L2, cwt_xyz2)
+
+                    # CTCA heatmap
+                    # with torch.no_grad():
+                    #     # delta: (B, N, D)
+                    #     delta_norm2 = torch.norm(delta2, dim=-1)  # (B, N)
+                    #     self.last_delta_norm2 = delta_norm2       # token space
+                    #     self.last_delta_hw2   = (Hp, Wp)
 
                     # g = sigmoid(Linear([L, Δ, M]))
                     if mask_tok is None:
                         raise RuntimeError("mask_tok is None in cross_fusion; check mask creation.")
                     
-                    delta2 = self.ctca(activation_result_rgb)
                     
+                    # gate_in2 = torch.cat([L2, delta2, mask_tok], dim=-1)
+                    # g2 = torch.sigmoid(self.gate_proj(gate_in2))                # (B,N,1)
+
+                    # logging
+                    # with torch.no_grad():
+                    #     g_mean = float(g2.mean().item())
+                    #     g_std  = float(g2.std(unbiased=False).item())
+
+                    #     # Δ norm
+                    #     d_norm = float(delta2.norm(dim=-1).mean().item())
+
+                    #     # 실제 적용된 update norm = ||(g*M)*Δ||
+                    #     upd_norm = float(((g2 * mask_tok) * delta2).norm(dim=-1).mean().item())
+
+                    #     self.last_tokgate["S2"]["g_mean"] = g_mean
+                    #     self.last_tokgate["S2"]["g_std"]  = g_std
+                    #     self.last_tokgate["S2"]["d_norm"] = d_norm
+                    #     self.last_tokgate["S2"]["upd_norm"] = upd_norm
+
+                    #     self.last_tokgate_map["S2"] = g2.view(B, Hp, Wp, 1).permute(0,3,1,2).contiguous().detach()
+
 
                     
                     # L2p = L2 + (g2 * mask_tok) * delta2                         # (B,N,D)
@@ -231,6 +257,66 @@ class CLFT(nn.Module):
                     # assemble할 때 업데이트된 xyz 토큰 사용
                     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
                     reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz_updated)
+
+                # elif i == 0:
+                #     cwt_cam0, w_cam0 = self.cwt(activation_result_rgb)
+                #     cwt_xyz0, w_xyz0 = self.cwt(activation_result_xyz)                  # mask 미적용
+
+                #     # token slot 정규화용
+                #     extras['tok_cam_s0'] = cwt_cam0
+                #     extras['w_cam_s0']   = w_cam0
+                #     extras['tok_xyz_s0'] = cwt_xyz0
+                #     extras['w_xyz_s0']   = w_xyz0
+
+                #     cls_token_stage0 = torch.cat([cwt_cam0, cwt_xyz0], dim=1)
+                #     ctsa_out0 = self.ctsa(cls_token_stage0)
+
+                #     cls_xyz0 = activation_result_xyz[:, :1, :]
+                #     L0 = activation_result_xyz[:, 1:, :]
+                #     C0 = activation_result_rgb[:, 1:, :]
+
+                #     delta0 = self.ctca(L0, ctsa_out0)                           # mask 미적용
+
+                #     # 클래스 토큰 concat (ctsa)제거 실험 (라이다 토큰으로만 클래스 토큰 생성)
+                #     # delta0 = self.ctca(L0, cwt_xyz0)
+                    
+                #     # CTCA heatmap
+                #     # with torch.no_grad():
+                #     #     # delta: (B, N, D)
+                #     #     delta_norm0 = torch.norm(delta0, dim=-1)  # (B, N)
+                #     #     self.last_delta_norm0 = delta_norm0       # token space
+                #     #     self.last_delta_hw0   = (Hp, Wp)
+                    
+                    
+                #     gate_in0 = torch.cat([L0, delta0, mask_tok], dim=-1)
+                #     g0 = torch.sigmoid(self.gate_proj(gate_in0))
+
+                #     # logging
+                #     with torch.no_grad():
+                #         g_mean = float(g0.mean().item())
+                #         g_std  = float(g0.std(unbiased=False).item())
+
+                #         d_norm = float(delta0.norm(dim=-1).mean().item())
+                #         upd_norm = float(((g0 * mask_tok) * delta0).norm(dim=-1).mean().item())
+
+                #         self.last_tokgate["S0"]["g_mean"] = g_mean
+                #         self.last_tokgate["S0"]["g_std"]  = g_std
+                #         self.last_tokgate["S0"]["d_norm"] = d_norm
+                #         self.last_tokgate["S0"]["upd_norm"] = upd_norm
+
+                #         self.last_tokgate_map["S0"] = g0.view(B, Hp, Wp, 1).permute(0,3,1,2).contiguous().detach()
+
+
+                    
+                #     L0p = L0 + (g0 * mask_tok) * delta0
+                #     # L0p = L0 + (mask_tok * delta0)
+                #     # L0p = L0 + self.alpha*(mask_tok * delta0)
+
+                #     # L0p = L0
+                #     activation_result_xyz_updated = torch.cat([cls_xyz0, L0p], dim=1)
+
+                #     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)
+                #     reassemble_result_XYZ = self.reassembles_XYZ[i](activation_result_xyz_updated)
 
                 else:
                     reassemble_result_RGB = self.reassembles_RGB[i](activation_result_rgb)

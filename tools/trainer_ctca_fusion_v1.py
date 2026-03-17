@@ -21,6 +21,10 @@ from torch.amp import autocast, GradScaler
 
 import os, csv
 from pathlib import Path
+# from tools.clft_ctca_reg_utils import cwt_reg_losses
+from tools.clft_cwt_patch_gt import build_patch_gt_soft
+from tools.clft_cwt_utils import compute_slot_class_score, reorder_slots, match_slots_k2
+from tools.clft_cwt_utils import slot_assignment_loss, attention_diversity_loss, token_diversity_loss, cross_modal_align_loss
 
 
 writer = SummaryWriter()
@@ -199,16 +203,133 @@ class Trainer(object):
                     # loss = self.criterion(output_seg, anno)
                     loss_ce = self.criterion(output_seg, anno)
 
+                    patch_gt, cls_mask = build_patch_gt_soft(
+                        gt=anno, 
+                        patch_size=self.patch_size, 
+                        class_ids=(2, 1), 
+                        ignore_index=255
+                    )
                     if extras is not None:
-                        camproto_loss, camproto_logs = self.camproto_criterion(
-                            extras["proto_tokens_s2"],
-                            extras["cam_maps_s2"],
-                            extras["present_mask_s2"],
-                        )
+                        # cam
+                        slot_score_raw_cam = compute_slot_class_score(extras['w_cam_s2'], patch_gt)
+                        perm_idx_cam = match_slots_k2(slot_score_raw_cam)
+                        tok_cam, attn_mean_cam = reorder_slots(extras['tok_cam_s2'], extras['w_cam_s2'], perm_idx_cam)
 
-                    loss = loss_ce + self.lambda_assgn * camproto_loss
+                        # re-tokenizer
+                        slot_score_cam = compute_slot_class_score(attn_mean_cam, patch_gt)
+
+                        # loss
+                        slot_assgn_loss_cam = slot_assignment_loss(slot_score_cam, cls_mask)
+                        div_tok_cam = token_diversity_loss(tok_cam)
+                        div_attn_cam = attention_diversity_loss(attn_mean_cam)
+                        div_loss_cam = div_attn_cam + 0.25 * div_tok_cam
+
+                        # lidar
+                        # slot_score_raw_xyz = compute_slot_class_score(extras['w_xyz_s2'], patch_gt)
+                        # perm_idx_xyz = match_slots_k2(slot_score_raw_xyz)
+                        # tok_xyz, attn_mean_xyz = reorder_slots(extras['tok_xyz_s2'], extras['w_xyz_s2'], perm_idx_xyz)
+
+                        # # re-tokenizer
+                        # slot_score_xyz = compute_slot_class_score(attn_mean_xyz, patch_gt)
+
+                        # # loss
+                        # slot_assgn_loss_xyz = slot_assignment_loss(slot_score_xyz, cls_mask)
+                        # div_tok_xyz = token_diversity_loss(tok_xyz)
+                        # div_attn_xyz = attention_diversity_loss(attn_mean_xyz)
+                        # div_loss_xyz = div_attn_xyz + 0.25 * div_tok_xyz
+
+                        # align_loss = cross_modal_align_loss(tok_cam, tok_xyz, cls_mask)
+
+                    # total
+                    # slot_assgn_loss = 0.5 * (slot_assgn_loss_cam + slot_assgn_loss_xyz)
+                    # div_loss = 0.5 * (div_loss_cam + div_loss_xyz)
+
+                    # loss = (
+                    #     loss_ce
+                    #     + self.lambda_assgn * slot_assgn_loss
+                    #     + self.lambda_div * div_loss
+                    #     # + self.lambda_align * align_loss
+                    # )
+
+                    loss = (
+                        loss_ce
+                        + self.lambda_assgn * slot_assgn_loss_cam
+                        + self.lambda_div * div_loss_cam
+                        # + self.lambda_align * align_loss
+                    )
 
                     
+                    
+                    # =========================
+                    # CWT logging block
+                    # =========================
+
+                    # reordered slot score 기준으로 class-aware 정렬 정도 확인
+                    cam_diag = 0.5 * (slot_score_cam[:, 0, 0] + slot_score_cam[:, 1, 1])
+                    cam_off  = 0.5 * (slot_score_cam[:, 0, 1] + slot_score_cam[:, 1, 0])
+                    margin_cam = (cam_diag - cam_off).mean()
+
+                    # xyz_diag = 0.5 * (slot_score_xyz[:, 0, 0] + slot_score_xyz[:, 1, 1])
+                    # xyz_off  = 0.5 * (slot_score_xyz[:, 0, 1] + slot_score_xyz[:, 1, 0])
+                    # margin_xyz = (xyz_diag - xyz_off).mean()
+
+                    # Hungarian permutation 안정성
+                    # perm = [0,1] 이면 identity, [1,0] 이면 swap
+                    swap_ratio_cam = (perm_idx_cam[:, 0] == 1).float().mean()
+                    # swap_ratio_xyz = (perm_idx_xyz[:, 0] == 1).float().mean()
+
+
+                    # slot collapse 여부: 두 slot attention cosine similarity
+                    tok_cam_n = F.normalize(tok_cam, dim=-1)
+                    # tok_xyz_n = F.normalize(tok_xyz, dim=-1)
+
+                    slot_tok_cos_cam = F.cosine_similarity(
+                        tok_cam_n[:, 0, :], tok_cam_n[:, 1, :], dim=1
+                    ).mean()
+
+                    # slot_tok_cos_xyz = F.cosine_similarity(
+                    #     tok_xyz_n[:, 0, :], tok_xyz_n[:, 1, :], dim=1
+                    # ).mean()
+
+                    # argmax 기준 slot dominance
+                    cam_argmax = attn_mean_cam.argmax(dim=1)   # (B, Np)
+                    # xyz_argmax = attn_mean_xyz.argmax(dim=1)   # (B, Np)
+
+                    cam_slot0_ratio = (cam_argmax == 0).float().mean()
+                    cam_slot1_ratio = (cam_argmax == 1).float().mean()
+                    # xyz_slot0_ratio = (xyz_argmax == 0).float().mean()
+                    # xyz_slot1_ratio = (xyz_argmax == 1).float().mean()
+
+                    # attention entropy: 너무 flat / 너무 peaky 체크
+                    def _slot_entropy(attn_mean):
+                        # attn_mean: (B, K, Np)
+                        ent = -(attn_mean * (attn_mean.clamp_min(1e-8)).log()).sum(dim=-1)  # (B,K)
+                        return ent.mean()
+
+                    slot_entropy_cam = _slot_entropy(attn_mean_cam)
+                    # slot_entropy_xyz = _slot_entropy(attn_mean_xyz)
+
+                    # camera-lidar agreement (같은 slot index끼리 얼마나 비슷한 patch를 보는지)
+                    # align_person_tok = F.cosine_similarity(
+                    #     tok_cam_n[:, 0, :], tok_xyz_n[:, 0, :], dim=1
+                    # )
+                    # align_car_tok = F.cosine_similarity(
+                    #     tok_cam_n[:, 1, :], tok_xyz_n[:, 1, :], dim=1
+                    # )
+
+                    valid_person = cls_mask[:, 0].float()
+                    valid_car = cls_mask[:, 1].float()
+
+                    # align_person_tok = (align_person_tok * valid_person).sum() / valid_person.sum().clamp_min(1.0)
+                    # align_car_tok = (align_car_tok * valid_car).sum() / valid_car.sum().clamp_min(1.0)
+
+                    # assignment accuracy
+                    pred_cam = slot_score_cam.argmax(dim=2)   # (B,K)
+                    # pred_xyz = slot_score_xyz.argmax(dim=2)   # (B,K)
+                    target = torch.arange(2, device=pred_cam.device).unsqueeze(0).expand_as(pred_cam)
+
+                    assign_acc_cam = (pred_cam == target).float().mean()
+                    # assign_acc_xyz = (pred_xyz == target).float().mean()
 
 
                 train_loss += loss.item()
@@ -220,8 +341,77 @@ class Trainer(object):
                 progress_bar.set_description(f'CLFT train loss:{loss:.4f}')
 
 
-                
-                
+                # ctca gate logging ep당 평균용
+                # tg = getattr(self.model, "last_tokgate", None)
+                # if tg is not None:
+                #     for st in ["S2", "S0"]:
+                #         d = tg.get(st, None)
+                #         if d is None: 
+                #             continue
+                #         gm = d.get("g_mean", None)
+                #         gs = d.get("g_std", None)
+                #         dn = d.get("d_norm", None)
+                #         un = d.get("upd_norm", None)
+                #         if gm is None or gs is None:
+                #             continue
+                #         g_sum[st] += float(gm)
+                #         s_sum[st] += float(gs)
+                #         d_sum[st] += float(dn)
+                #         u_sum[st] += float(un)
+                #         mins[st]["g"]  = min(mins[st]["g"],  float(gm));  maxs[st]["g"]  = max(maxs[st]["g"],  float(gm))
+                #         mins[st]["gs"] = min(mins[st]["gs"], float(gs));  maxs[st]["gs"] = max(maxs[st]["gs"], float(gs))
+                #         mins[st]["d"]  = min(mins[st]["d"],  float(dn));  maxs[st]["d"]  = max(maxs[st]["d"],  float(dn))
+                #         mins[st]["u"]  = min(mins[st]["u"],  float(un));  maxs[st]["u"]  = max(maxs[st]["u"],  float(un))
+                #         cnt[st]   += 1
+
+                # ctca gate logging
+                if (i % 20) == 0:
+                    print(
+                        "[CWT_STEP] "
+                        f"ce={loss_ce.item():.4f} "
+                        f"ass_cam={slot_assgn_loss_cam.item():.4f} "
+                        # f"ass_xyz={slot_assgn_loss_xyz.item():.4f} "
+                        f"div_cam={div_loss_cam.item():.4f} "
+                        # f"div_xyz={div_loss_xyz.item():.4f} | "
+                        f"margin_cam={margin_cam.item():.4f} "
+                        # f"margin_xyz={margin_xyz.item():.4f} | "
+                        f"swap_cam={swap_ratio_cam.item():.3f} "
+                        # f"swap_xyz={swap_ratio_xyz.item():.3f} | "
+                        f"cos_cam={slot_tok_cos_cam.item():.4f} "
+                        # f"cos_xyz={slot_tok_cos_xyz.item():.4f}"
+                    )
+
+                    print(
+                        "[CWT_STEP2] "
+                        f"arg_cam=({cam_slot0_ratio.item():.3f},{cam_slot1_ratio.item():.3f}) "
+                        # f"arg_xyz=({xyz_slot0_ratio.item():.3f},{xyz_slot1_ratio.item():.3f}) | "
+                        f"ent_cam={slot_entropy_cam.item():.4f} "
+                        # f"ent_xyz={slot_entropy_xyz.item():.4f} | "
+                        # f"algn_person={align_person_tok.item():.4f} "
+                        # f"algn_car={align_car_tok.item():.4f} | "
+                        f"acc_cam={assign_acc_cam.item():.3f} "
+                        # f"acc_xyz={assign_acc_xyz.item():.3f}"
+                    )
+
+                    # tg = getattr(self.model, "last_tokgate", None)
+                    # if tg is not None:
+                    #     s2 = tg.get("S2", None)
+                    #     s0 = tg.get("S0", None)
+
+                    #     def fmt(stage_dict, name):
+                    #         if stage_dict is None:
+                    #             return f"{name}: None"
+                    #         gm = stage_dict.get("g_mean", None)
+                    #         gs = stage_dict.get("g_std", None)
+                    #         dn = stage_dict.get("d_norm", None)
+                    #         un = stage_dict.get("upd_norm", None)
+                    #         if gm is None or gs is None:
+                    #             return f"{name}: (empty)"
+                    #         if dn is None or un is None:
+                    #             return f"{name}: g_mean={gm:.6f} g_std={gs:.6f}"
+                    #         return f"{name}: g_mean={gm:.6f} g_std={gs:.6f} | d_norm={dn:.6f} upd_norm={un:.6f}"
+
+                    #     print("[CTCA_STEP]", fmt(s2, "S2"), "|", fmt(s0, "S0"))
                     
             
             # The IoU of one epoch
@@ -234,6 +424,45 @@ class Trainer(object):
 
             valid_epoch_loss, valid_epoch_IoU = self.validate_clft(valid_dataloader, modality)
 
+            # 평균출력
+            # def avg(st, arr_sum, arr_cnt):
+            #     return (arr_sum[st] / arr_cnt[st]) if arr_cnt[st] > 0 else float("nan")
+
+            # S2_gm = avg("S2", g_sum, cnt); S2_gs = avg("S2", s_sum, cnt)
+            # S2_dn = avg("S2", d_sum, cnt); S2_un = avg("S2", u_sum, cnt)
+            # S0_gm = avg("S0", g_sum, cnt); S0_gs = avg("S0", s_sum, cnt)
+            # S0_dn = avg("S0", d_sum, cnt); S0_un = avg("S0", u_sum, cnt)
+
+            # print(
+            #     f"[CTCA_EPOCH_AVG] "
+            #     f"S2 g={S2_gm:.6f}±{S2_gs:.6f} d={S2_dn:.6f} upd={S2_un:.6f} | "
+            #     f"S0 g={S0_gm:.6f}±{S0_gs:.6f} d={S0_dn:.6f} upd={S0_un:.6f}"
+            # )
+
+            # # --- CSV append (after we have everything) ---
+            # veh_tr = float(train_epoch_IoU[0].item())
+            # hum_tr = float(train_epoch_IoU[1].item())
+            # veh_va = float(valid_epoch_IoU[0].item())
+            # hum_va = float(valid_epoch_IoU[1].item())
+
+            # row = [
+            #     epoch, float(lr),
+            #     float(train_epoch_loss), veh_tr, hum_tr,
+            #     float(valid_epoch_loss), veh_va, hum_va,
+            #     float(S2_gm), float(S2_gs), float(S2_dn), float(S2_un),
+            #     float(S0_gm), float(S0_gs), float(S0_dn), float(S0_un),
+            # ]
+
+            # row += [
+            # mins["S2"]["g"],  maxs["S2"]["g"], mins["S2"]["gs"], maxs["S2"]["gs"], 
+            # mins["S2"]["d"],  maxs["S2"]["d"], mins["S2"]["u"],  maxs["S2"]["u"],
+            # mins["S0"]["g"],  maxs["S0"]["g"], mins["S0"]["gs"], maxs["S0"]["gs"], 
+            # mins["S0"]["d"],  maxs["S0"]["d"], mins["S0"]["u"],  maxs["S0"]["u"],
+            # ]
+
+            # with open(self.ctca_csv_path, "a", newline="") as f:
+            #     csv.writer(f).writerow(row)
+            # print(f"[EPOCH_CSV] appended -> {self.ctca_csv_path}")
 
             # Plot the train and validation loss in Tensorboard
             writer.add_scalars('Loss', {'train': train_epoch_loss,
@@ -298,15 +527,60 @@ class Trainer(object):
                     # loss = self.criterion(output_seg, anno)
                     loss_ce = self.criterion(output_seg, anno)
 
+                    patch_gt, cls_mask = build_patch_gt_soft(
+                        gt=anno, 
+                        patch_size=self.patch_size, 
+                        class_ids=(2, 1), 
+                        ignore_index=255
+                    )
                     if extras is not None:
-                        camproto_loss, camproto_logs = self.camproto_criterion(
-                            extras["proto_tokens_s2"],
-                            extras["cam_maps_s2"],
-                            extras["present_mask_s2"],
-                        )
+                        # cam
+                        slot_score_raw_cam = compute_slot_class_score(extras['w_cam_s2'], patch_gt)
+                        perm_idx_cam = match_slots_k2(slot_score_raw_cam)
+                        tok_cam, attn_mean_cam = reorder_slots(extras['tok_cam_s2'], extras['w_cam_s2'], perm_idx_cam)
 
-                    loss = loss_ce + self.lambda_assgn * camproto_loss
-                        
+                        # re-tokenizer
+                        slot_score_cam = compute_slot_class_score(attn_mean_cam, patch_gt)
+
+                        # loss
+                        slot_assgn_loss_cam = slot_assignment_loss(slot_score_cam, cls_mask)
+                        div_tok_cam = token_diversity_loss(tok_cam)
+                        div_attn_cam = attention_diversity_loss(attn_mean_cam)
+                        div_loss_cam = div_attn_cam + 0.25 * div_tok_cam
+
+                        # lidar
+                        # slot_score_raw_xyz = compute_slot_class_score(extras['w_xyz_s2'], patch_gt)
+                        # perm_idx_xyz = match_slots_k2(slot_score_raw_xyz)
+                        # tok_xyz, attn_mean_xyz = reorder_slots(extras['tok_xyz_s2'], extras['w_xyz_s2'], perm_idx_xyz)
+
+                        # # re-tokenizer
+                        # slot_score_xyz = compute_slot_class_score(attn_mean_xyz, patch_gt)
+
+                        # # loss
+                        # slot_assgn_loss_xyz = slot_assignment_loss(slot_score_xyz, cls_mask)
+                        # div_tok_xyz = token_diversity_loss(tok_xyz)
+                        # div_attn_xyz = attention_diversity_loss(attn_mean_xyz)
+                        # div_loss_xyz = div_attn_xyz + 0.25 * div_tok_xyz
+
+                        # align_loss = cross_modal_align_loss(tok_cam, tok_xyz, cls_mask)
+
+                    # total
+                    # slot_assgn_loss = 0.5 * (slot_assgn_loss_cam + slot_assgn_loss_xyz)
+                    # div_loss = 0.5 * (div_loss_cam + div_loss_xyz)
+
+                    # loss = (
+                    #     loss_ce
+                    #     + self.lambda_assgn * slot_assgn_loss
+                    #     + self.lambda_div * div_loss
+                    #     # + self.lambda_align * align_loss
+                    # )
+
+                    loss = (
+                        loss_ce
+                        + self.lambda_assgn * slot_assgn_loss_cam
+                        + self.lambda_div * div_loss_cam
+                        # + self.lambda_align * align_loss
+                    )
 
                 valid_loss += loss.item()
                 progress_bar.set_description(f'valid fusion loss: {loss:.4f}')
